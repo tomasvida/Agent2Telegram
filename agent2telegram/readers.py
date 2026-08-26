@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 import os
 import urllib.parse
 from dataclasses import dataclass
@@ -31,10 +32,11 @@ from dataclasses import dataclass
 
 @dataclass
 class Ev:
-    kind: str               # turn_start | user | text | tool | turn_end
+    kind: str               # turn_start | user | text | tool | files | turn_end
     text: str = ""          # message / tool-summary text
     key: str = ""           # stable dedup id (text uuid/hash, tool call id)
     final: bool = False      # for 'text': hint that this is the final answer
+    files: tuple = ()        # for 'files': paths the agent wants delivered to the user
 
 
 def _short(s: str, n: int = 58) -> str:
@@ -82,6 +84,29 @@ def _text_of(content) -> str:
     return ""
 
 
+
+#: Tools by which an agent hands a FILE to the user. The harness runs them itself, so the bridge
+#: never sees a call — only its record in the transcript. Without this the file silently vanishes:
+#: the reply arrives, the attachment does not, and nothing anywhere says so (2026-08-24).
+#: Recognising the tool by name is deliberate — it beats guessing from prose, which would be
+#: language-dependent and full of false positives.
+FILE_SEND_TOOLS = {"senduserfile"}
+
+
+def _file_tool_paths(name: str, inp) -> tuple:
+    """Paths a file-sending tool call asks to deliver, or () when it is not such a call."""
+    if str(name or "").strip().lower() not in FILE_SEND_TOOLS:
+        return ()
+    if not isinstance(inp, dict):
+        return ()
+    raw = inp.get("files") or inp.get("file") or inp.get("paths") or inp.get("path")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return ()
+    return tuple(p for p in raw if isinstance(p, str) and p.strip())
+
+
 class ClaudeCodeReader:
     """Claude Code transcript (one JSONL record per message; assistant records carry text and
     tool_use blocks; user records may be real messages or tool results). No turn boundaries in
@@ -90,14 +115,34 @@ class ClaudeCodeReader:
     name = "claude-code"
     emits_turn_end = False
 
+    @staticmethod
+    def _is_tool_result(rec: dict) -> bool:
+        """A ``user`` record that is really a TOOL RESULT, not something the person typed.
+
+        Claude Code files tool results under ``type: "user"``. They are indistinguishable from a
+        real prompt by type alone, and treating one as a prompt is not cosmetic: the bridge
+        decides from the last user text whether the turn came from Telegram, so a tool result
+        silently reclassified a live Telegram turn as terminal-originated and the answer was
+        never forwarded — no error, no backstop, nothing in the log (2026-08-23, an image the
+        agent read mid-turn).
+        """
+        if "toolUseResult" in rec:
+            return True
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list):
+            return any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+        return False
+
     def user_text(self, rec: dict) -> str | None:
-        if rec.get("type") != "user":
+        if rec.get("type") != "user" or self._is_tool_result(rec):
             return None
         return _text_of(rec.get("message", {}).get("content"))
 
     def parse(self, rec: dict):
         typ = rec.get("type")
         if typ == "user":
+            if self._is_tool_result(rec):
+                return                      # a tool result is not something the person typed
             t = _text_of(rec.get("message", {}).get("content"))
             if t.strip():
                 yield Ev("user", text=t)
@@ -115,8 +160,13 @@ class ClaudeCodeReader:
         for b in blocks:
             if isinstance(b, dict) and b.get("type") == "tool_use":
                 tid = b.get("id")
-                if tid:
-                    yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
+                if not tid:
+                    continue
+                paths = _file_tool_paths(b.get("name", ""), b.get("input"))
+                if paths:
+                    yield Ev("files", key=tid, files=paths)
+                    continue                      # not a tool bubble — it is an attachment
+                yield Ev("tool", text=_claude_tool_summary(b.get("name", ""), b.get("input")), key=tid)
 
 
 # --------------------------------------------------------------------------- Codex
@@ -151,6 +201,21 @@ def _codex_tool_summary(payload: dict) -> str:
     return "🛠️ tool"
 
 
+def _codex_message_text(payload: dict, block_type: str) -> str:
+    """Join the ``block_type`` parts of a Codex ``response_item/message`` payload.
+
+    Codex >= 0.149 records user prompts (``input_text``) and assistant replies (``output_text``)
+    only in this form; the legacy ``event_msg`` records are gone.
+    """
+    parts = payload.get("content")
+    if not isinstance(parts, list):
+        return ""
+    return "".join(
+        part.get("text") or "" for part in parts
+        if isinstance(part, dict) and part.get("type") == block_type
+    ).strip()
+
+
 class CodexReader:
     """Codex CLI rollout transcript (``~/.codex/sessions/.../rollout-*.jsonl``). Each line is an
     ``event_msg`` or ``response_item`` with a ``payload.type``. Crucially it records explicit
@@ -160,10 +225,25 @@ class CodexReader:
     name = "codex"
     emits_turn_end = True
 
+    def __init__(self) -> None:
+        # Codex <= 0.144 logs an agent reply TWICE: first as ``event_msg/agent_message``, then as
+        # ``response_item/message`` (role=assistant). Newer Codex (>= 0.149) logs ONLY the second
+        # form. We therefore read both and remember what we already emitted, so old versions do not
+        # double-send and new versions do not go silent. Silence is the dangerous failure here: the
+        # bridge keeps showing "typing" while the reply never arrives (reported 2026-08-23).
+        # A bounded window, not a session-wide set: the two records of one reply sit next to each
+        # other in the log, while an agent legitimately repeating the same sentence later in the
+        # session must still be delivered.
+        self._recent_msgs: deque = deque(maxlen=8)
+        self._recent_users: deque = deque(maxlen=8)
+
     def user_text(self, rec: dict) -> str | None:
         p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
         if rec.get("type") == "event_msg" and p.get("type") == "user_message":
             return p.get("message", "")
+        if (rec.get("type") == "response_item" and p.get("type") == "message"
+                and p.get("role") == "user"):
+            return _codex_message_text(p, "input_text") or None
         return None
 
     def parse(self, rec: dict):
@@ -175,13 +255,31 @@ class CodexReader:
         elif t == "event_msg" and pt == "user_message":
             msg = p.get("message", "")
             if msg.strip():
+                h = _hash(msg.strip())
+                if h in self._recent_users:
+                    return
+                self._recent_users.append(h)
+                yield Ev("user", text=msg)
+        elif t == "response_item" and pt == "message" and p.get("role") == "user":
+            msg = _codex_message_text(p, "input_text")
+            if msg and _hash(msg) not in self._recent_users:
+                self._recent_users.append(_hash(msg))
                 yield Ev("user", text=msg)
         elif t == "event_msg" and pt == "agent_message":
             msg = (p.get("message") or "").strip()
             if msg:
                 ts = rec.get("timestamp", "")
+                self._recent_msgs.append(_hash(msg))
                 yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
                          final=(p.get("phase") == "final_answer"))
+        elif t == "response_item" and pt == "message" and p.get("role") == "assistant":
+            # Fallback for Codex >= 0.149, which no longer emits event_msg/agent_message.
+            msg = _codex_message_text(p, "output_text")
+            if msg and _hash(msg) not in self._recent_msgs:
+                ts = rec.get("timestamp", "")
+                self._recent_msgs.append(_hash(msg))
+                yield Ev("text", text=msg, key=f"{ts}:{_hash(msg)}",
+                         final=(p.get("phase") == "final_answer" or p.get("phase") is None))
         elif t == "response_item" and pt in ("function_call", "custom_tool_call", "web_search_call"):
             if pt == "web_search_call":
                 action = p.get("action") if isinstance(p.get("action"), dict) else {}

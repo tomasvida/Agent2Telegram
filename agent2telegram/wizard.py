@@ -156,7 +156,7 @@ def _choose_session(agent_cls) -> str:
     while True:
         choice = _ask("Pick a number, or 'n' for new", "n" if not sessions else "1")
         if choice.lower() == "n":
-            name = _ask("Name for the new session", "lana")
+            name = _ask("Name for the new session", "agent")
             if _create_session(name, agent_cls):
                 print(f"  ✓ created '{name}' and started {agent_cls.label} in it.")
                 return name
@@ -374,14 +374,14 @@ def _detect_agent_in_session(session: str):
 def connect(name: str | None = None) -> int:
     """`agent2telegram connect` — wire ONE existing agent (a tmux session) to its OWN Telegram bot,
     as a separate bridge with its own config file. Lets you run several bots from one install
-    (e.g. one per agent created with `agentsmon new`) without touching the others."""
+    (for example one per agent session) without touching the others."""
     print("=== Connect an agent to Telegram ===")
     if not _tmux():
         print("⚠️  tmux not found — attach mode drives a tmux session. Install tmux first.")
         return 1
     sessions = _list_sessions()
     if not sessions:
-        print("No tmux sessions found — create an agent first (e.g. `agentsmon new`), then re-run.")
+        print("No tmux sessions found — start your agent in a tmux session first, then re-run.")
         return 1
     print("\nWhich agent (tmux session) do you want to connect?\n")
     for i, s in enumerate(sessions, 1):
@@ -444,7 +444,8 @@ def connect(name: str | None = None) -> int:
                      stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"  ✓ running — logs at {log}")
     print(f"  Message @{me.get('username')} on Telegram to test it.")
-    print("  Keep it alive across reboots by adding it to your monitoring (e.g.  agentsmon add).")
+    print("  Keep it alive across reboots with your process supervisor "
+          "(systemd, launchd — see `agent2telegram service`).")
     return 0
 
 
@@ -455,7 +456,7 @@ def set_elevenlabs(config: str | None = None) -> int:
     import os
     if config:
         os.environ["AGENT2TELEGRAM_CONFIG"] = config
-    from .config import load, save, ConfigError
+    from .config import load, mark_secret_from_file, save, ConfigError
     try:
         cfg = load()
     except ConfigError as e:
@@ -467,10 +468,11 @@ def set_elevenlabs(config: str | None = None) -> int:
         print("Nothing entered — aborted.")
         return 1
     cfg.elevenlabs_api_key = key
+    mark_secret_from_file(cfg, "elevenlabs_api_key")
     path = save(cfg)
     print(f"  ✓ Saved to {path} (permissions 0600).")
     # One ElevenLabs account = one key for ALL bots. Apply it to every bridge config in the dir
-    # so voice works across all agents (Codex / Claude Code / Hermes / OpenClaw) after setting it
+    # so voice works across every configured agent after setting it
     # once — not just the active bridge.
     from .config import config_path, load as load_cfg
     others = 0
@@ -483,6 +485,7 @@ def set_elevenlabs(config: str | None = None) -> int:
             continue
         if other.elevenlabs_api_key != key:
             other.elevenlabs_api_key = key
+            mark_secret_from_file(other, "elevenlabs_api_key")
             save(other, p)
             others += 1
     if others:

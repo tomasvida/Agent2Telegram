@@ -6,8 +6,10 @@ and working state persist across messages — exactly like talking to it in a te
 works for any agent that has an interactive CLI (Claude Code, Codex, …).
 
 Inbound (proven send-keys sequence): clear the prompt line (``C-u``), type the message
-literally (``send-keys -l --``), then submit (``Enter``). Newlines are collapsed so a single
-Enter submits the whole message.
+literally (``send-keys -l --``), then submit. Most TUIs use synthetic ``Enter``; Claude
+Code uses the terminal CSI-u Enter sequence because its composer does not reliably submit
+via tmux's synthetic Enter. Newlines are collapsed so one submit event sends the whole
+message.
 
 Completion + response — two strategies:
   * **Hook** (robust, used for Claude Code): the agent runs a Stop hook at end of turn that
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -33,6 +36,15 @@ log = logging.getLogger("agent2telegram.session")
 _SEP_RE = re.compile(r"^[\s─━—–_=·.\-]{6,}$")
 _STATUS_RE = re.compile(r"^[✻✶✳✢✺✷*]\s")           # spinner/status, e.g. "✻ Worked for 1s"
 _BULLET_RE = re.compile(r"^\s*[⏺●○•]\s?")           # assistant output bullet
+
+MAX_TMUX_INJECTION_CHARS = 8000
+_SHELL_COMMANDS = {
+    "ash", "bash", "csh", "dash", "fish", "ksh", "mksh", "pwsh", "sh", "tcsh", "zsh",
+}
+_AGENT_WRAPPERS = {
+    "bun", "deno", "node", "nodejs", "npm", "npx", "pnpm", "python", "python3", "uv",
+    "uvx", "yarn",
+}
 
 
 def _clean_tui(text: str) -> str:
@@ -51,6 +63,163 @@ def _clean_tui(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def sanitize_for_tmux(text: str) -> str:
+    """Drop terminal control bytes that tmux would otherwise pass to the live TUI."""
+    out = []
+    for ch in text:
+        codepoint = ord(ch)
+        if (
+            ch not in "\n\t"
+            and (codepoint < 0x20 or codepoint == 0x7f or 0x80 <= codepoint <= 0x9f)
+        ):
+            continue
+        out.append(ch)
+        if len(out) >= MAX_TMUX_INJECTION_CHARS:
+            break
+    return "".join(out)
+
+
+def _command_name(command: str) -> str:
+    return Path(str(command).strip()).name.lower().lstrip("-")
+
+
+def _argv0(args: str) -> str:
+    if not args:
+        return ""
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        parts = str(args).split()
+    return parts[0] if parts else ""
+
+
+def _command_names(commands: list[str] | tuple[str, ...] | set[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    seen = set()
+    for command in commands:
+        name = _command_name(command)
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return tuple(out)
+
+
+def _mentions_expected_agent(args: str, expected: tuple[str, ...]) -> bool:
+    low = (args or "").lower()
+    for name in expected:
+        if re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", low):
+            return True
+    return False
+
+
+def _process_command_names(command: str, args: str) -> tuple[str, ...]:
+    out: list[str] = []
+    seen = set()
+    for value in (command, _argv0(args)):
+        name = _command_name(value)
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return tuple(out)
+
+
+def _process_matches_agent(command: str, args: str, expected: tuple[str, ...]) -> bool:
+    names = _process_command_names(command, args)
+    if any(name in expected for name in names):
+        return True
+    return any(name in _AGENT_WRAPPERS for name in names) and _mentions_expected_agent(args, expected)
+
+
+def _process_shell_name(command: str, args: str) -> str:
+    for name in _process_command_names(command, args):
+        if name in _SHELL_COMMANDS:
+            return name
+    return ""
+
+
+def _pane_value(target: str, fmt: str) -> str:
+    res = _tmux("display-message", "-p", "-t", target, fmt, check=False, timeout=3)
+    return (res.stdout or "").strip() if res.returncode == 0 else ""
+
+
+def _pane_processes(target: str) -> list[tuple[int, int, str, str]]:
+    pid_s = _pane_value(target, "#{pane_pid}")
+    if not pid_s.isdigit():
+        return []
+    root_pid = int(pid_s)
+    try:
+        proc = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,comm=,args="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+
+    rows: dict[int, tuple[int, int, str, str]] = {}
+    children: dict[int, list[int]] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        args = parts[3] if len(parts) > 3 else command
+        rows[pid] = (pid, ppid, command, args)
+        children.setdefault(ppid, []).append(pid)
+
+    found: list[tuple[int, int, str, str]] = []
+    stack = [root_pid]
+    seen = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        row = rows.get(pid)
+        if row:
+            found.append(row)
+        stack.extend(children.get(pid, ()))
+    return found
+
+
+def _agent_alive(target: str, expected_commands: list[str] | tuple[str, ...] | set[str]) -> tuple[bool, str]:
+    expected = _command_names(expected_commands)
+    if not expected:
+        return True, "no expected agent command configured"
+
+    current = _pane_value(target, "#{pane_current_command}")
+    current_name = _command_name(current)
+    expected_s = ", ".join(expected)
+    if current_name in expected:
+        return True, f"tmux pane command is {current_name}"
+
+    # Security guard: send-keys must only target a live agent TUI. tmux may report a
+    # stale title or a login shell as the pane command, so first search the pane's full
+    # process subtree for the configured agent binary by basename.
+    processes = _pane_processes(target)
+    for _pid, _ppid, command, args in processes:
+        if _process_matches_agent(command, args, expected):
+            return True, f"tmux pane process is {_command_name(command)}"
+
+    shell_name = current_name if current_name in _SHELL_COMMANDS else ""
+    if not shell_name and len(processes) == 1:
+        _pid, _ppid, command, args = processes[0]
+        shell_name = _process_shell_name(command, args)
+    if shell_name:
+        return False, f"tmux pane is at a shell prompt ({shell_name}); expected {expected_s}"
+
+    detail = current_name or "unknown"
+    return False, f"tmux pane command is {detail}; expected {expected_s}"
+
+
 class SessionError(Exception):
     pass
 
@@ -65,9 +234,10 @@ class TmuxSession:
     def __init__(self, agent_argv: list[str], *, cwd: Path, name: str | None = None,
                  timeout: int = 600, idle: float = 1.5, settle: float = 0.4,
                  origin_prefix: str = "", signal_file: Path | None = None,
-                 boot_wait: float = 2.0, submit: str = "enter") -> None:
+                 boot_wait: float = 2.0, submit: str = "enter",
+                 expected_agent_commands: list[str] | tuple[str, ...] | None = None) -> None:
         if shutil.which("tmux") is None:
-            raise SessionError("tmux is not installed. Install tmux (e.g. `brew install tmux` "
+            raise SessionError("tmux is not installed. Install it first: `sudo apt install tmux` (Debian/Ubuntu) or `brew install tmux` (macOS) — "
                                "or `apt install tmux`) — the persistent session needs it.")
         if submit not in {"enter", "csi-u"}:
             raise ValueError("submit must be 'enter' or 'csi-u'")
@@ -80,6 +250,7 @@ class TmuxSession:
         # Claude Code's current TUI does not submit reliably via tmux's synthetic Enter.
         # It accepts the terminal's CSI-u Enter sequence instead; codex/generic keep Enter.
         self._submit = submit
+        self._expected_agent_commands = tuple(expected_agent_commands or (agent_argv[:1] if agent_argv else ()))
         cwd.mkdir(parents=True, exist_ok=True)
         if not self._exists():
             if not agent_argv:
@@ -102,10 +273,21 @@ class TmuxSession:
         _tmux("kill-session", "-t", self.name, check=False)
 
     # ---- messaging ---------------------------------------------------------
+    def _pane_ok(self) -> tuple[bool, str]:
+        return _agent_alive(self.name, getattr(self, "_expected_agent_commands", ()))
+
     def _send_keys(self, text: str) -> None:
+        ok, detail = self._pane_ok()
+        if not ok:
+            # Fail closed: if the agent has crashed back to a shell, Enter would execute the
+            # Telegram message as a shell command instead of submitting it to the agent TUI.
+            log.warning("refusing tmux injection into '%s': %s", self.name, detail)
+            raise SessionError(f"refusing to inject into tmux session '{self.name}': {detail}")
+        text = sanitize_for_tmux(text)
         text = " ".join(text.splitlines())                 # one Enter submits everything
         if self._origin:
             text = f"{self._origin}{text}"
+        text = sanitize_for_tmux(text)
         if self._submit == "csi-u":
             # Give the TUI enough time to process the literal paste before submitting.
             _tmux("send-keys", "-t", self.name, "C-u"); time.sleep(0.3)

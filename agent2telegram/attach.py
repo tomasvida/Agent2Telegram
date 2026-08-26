@@ -14,19 +14,30 @@ This keeps the agent's full session (context, persona, tools) and adds Telegram 
 """
 from __future__ import annotations
 
+from collections import deque
 import glob
 import html
 import json
+import os
 import logging
+import queue
+import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
+from . import adapters
 from . import readers
-from .config import Config
-from .session import TmuxSession
-from .telegram import TelegramClient
+from . import tts
+from .compat import AlreadyRunning, single_instance_lock
+from .config import Config, _state_dir
+from .durable import DurableInbox, DurableOutbox
+from .session import SessionError, TmuxSession
+from .telegram import TelegramClient, TelegramError, is_network_error, split_message
 
 log = logging.getLogger("agent2telegram.attach")
 
@@ -34,9 +45,39 @@ log = logging.getLogger("agent2telegram.attach")
 #: the Stop-hook turn-end marker never arrives. The marker is the primary, precise signal —
 #: this just stops "typing…" from hanging forever if the hook is missing/misconfigured.
 IDLE_DONE = 90.0
+# A write to tmux can fail transiently (busy pane, full buffer), so it is retried.
+# A short pause on purpose: a user's message must not wait longer than the user's patience.
+INJECT_ATTEMPTS = 3
+INJECT_RETRY_WAIT = 1.5
+# How many times a stored inbound message is retried before it lands in dead-letter.
+# Better to shelve it there with a reason than delete it — at least it stays traceable.
+INBOUND_MAX_ATTEMPTS = 5
+# How many times an outgoing attachment is retried before giving up. Without a cap one bad
+# attachment would hold the head of the FIFO queue forever and block every later reply.
+OUTBOX_MAX_ATTEMPTS = 3
+# How often a message left in durable storage is retried WHILE RUNNING. Without this it waited
+# for a restart — for a service running for weeks, effectively forever (review finding #1).
+INBOUND_RETRY_INTERVAL = 30.0
+#: A turn finishing faster than this is almost certainly a stale end-of-turn signal, not real work.
+SUSPICIOUS_TURN_SECONDS = 3.0
+# How often the outbound loop checks whether there is anything to send. Was 0.4 s; shortened to
+# 0.15 s, because over long work with dozens of progress messages it added up to a noticeable
+# delay. The cost is reading the queue more often — so it was measured, not guessed.
+OUTBOUND_TICK = 0.15
+# How long after a receipt ACK no further ACK is sent. Five messages in a row should trigger
+# one "got it", not five.
+QUEUE_ACK_COOLDOWN = 30.0
+# How many characters of a quoted message are passed to the agent. Enough to recognise, few
+# enough not to flood the prompt.
+REPLY_QUOTE_CHARS = 300
 #: How often we re-assert the "typing…" chat action (Telegram shows it for ~5s). Kept well
 #: under that window so a turn never shows a gap, even right after a sent message clears it.
 TYPING_INTERVAL = 1.5
+
+# Turn-end backstop: transcript writes can lag the turn-end signal by a fraction of a second
+# (especially after a reset/reconnect), so give the final assistant text a short chance to land.
+BACKSTOP_RETRY_ATTEMPTS = 5
+BACKSTOP_RETRY_DELAY = 0.35
 
 #: Codex only: hold the first scraped tool bubble until the turn's intro text has been forwarded
 #: (agents usually say what they'll do, THEN call the tool). The scraper is live but the Codex
@@ -44,14 +85,43 @@ TYPING_INTERVAL = 1.5
 #: grace we show bubbles anyway, since some turns call a tool with no intro text.
 TUI_BUBBLE_GRACE = 3.0
 
+# Short disk ledger for Telegram update_ids already accepted by attach mode. Offset persistence is
+# the primary protection; this catches stale replays if a crash lands in the small ACK window.
+PROCESSED_UPDATE_LEDGER_LIMIT = 500
+# Keep slow media downloads/STT from becoming a resource sink. Telegram voice notes are normally
+# tiny; 25 MB still leaves room for long clips while bounding download + STT work.
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+# Final prompt guard after text, captions, downloaded-file notes, or STT results are combined.
+MAX_INBOUND_PROMPT_CHARS = 12_000
+
 #: Registered with Telegram (setMyCommands) so typing "/" shows the command autocomplete menu.
 BOT_COMMANDS = [
     {"command": "start", "description": "Intro and what you can send"},
     {"command": "help", "description": "Intro and what you can send"},
     {"command": "status", "description": "Connection and voice status"},
     {"command": "setkey", "description": "Enable voice (your ElevenLabs API key)"},
+    {"command": "voice", "description": "Toggle spoken (voice-note) replies"},
     {"command": "id", "description": "Show your Telegram id"},
 ]
+
+#: Injected ahead of the user's message while voice mode is ON, so the AGENT writes a reply meant
+#: to be HEARD rather than read. This marker — not a regex — is the heart of voice mode: the model
+#: phrases speakable text (short, numbers as words, no paths) far better than any post-processing.
+#: Same idea as the "[voice transcript …]" marker on the inbound side.
+VOICE_MODE_HINT = (
+    "[voice mode ON — your reply will be SPOKEN, not read. HARD RULE: keep it under ~20 seconds "
+    "of speech (a few short sentences). The whole point is that the user does not have to read, "
+    "so a long voice note defeats it. Say the one thing that matters; offer details only if asked. "
+    "Conversational tone, numbers as words, no markdown, tables, code, file paths or URLs.]"
+)
+#: Above this length a reply is sent as TEXT even in voice mode — reading a two-page analysis
+#: aloud is worse than scannable text (and a >~45 s voice note is unwieldy). The agent is asked
+#: to keep spoken replies short; this is the backstop when it doesn't.
+# Ceiling for reading aloud. Raised from 600 (2026-08-01), but it is a BACKSTOP, not a target.
+# The point of voice mode is that the user need not read; a long voice note defeats that just
+# like a long text does. The agent should write SHORTER, not write all the way up to here.
+VOICE_MAX_CHARS = 1200
+
 
 import re as _re  # noqa: E402
 from .readers import _short  # noqa: E402
@@ -89,7 +159,54 @@ def _extract_tui_tools(pane: str) -> list:
     return out
 
 
+def _expected_agent_commands(cfg: Config) -> list[str]:
+    """Commands that are allowed to own the tmux pane before we send keys into it."""
+    commands: list[str] = []
+    cls = adapters.REGISTRY.get(cfg.agent)
+    if cls is not None:
+        commands.extend(cls.tui_launch()[:1])
+        if cls.binary:
+            commands.append(cls.binary)
+    if cfg.command:
+        commands.append(cfg.command[0])
+    if cfg.continue_command:
+        commands.append(cfg.continue_command[0])
+
+    seen = set()
+    out = []
+    for command in commands:
+        name = Path(str(command)).name
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    if not out:
+        raise ValueError(
+            "attach mode cannot verify the tmux pane: configure an agent command to allow"
+        )
+    return out
+
+
+
+def _in_test_run() -> bool:
+    """True when this process is a test run, whatever runner started it.
+
+    Checking only ``PYTEST_CURRENT_TEST`` was not enough: the project's own CI runs
+    ``python -m unittest discover``, where that variable does not exist — so the guard this
+    backs (see ``_ensure_outbox``) silently did not apply, in exactly the environment where an
+    unfamiliar contributor runs the suite for the first time. The production bridge imports
+    neither runner, so their presence in ``sys.modules`` is a reliable signal.
+    """
+    return ("PYTEST_CURRENT_TEST" in os.environ
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules)
+
+
 class AttachBridge:
+    _turn_end_backstop_enabled = True
+    #: Durable outbox with per-part confirmation. Off by default for objects built without
+    #: __init__ (focused tests), which have no queue path to write to.
+    _use_durable_outbox = True
+
     def __init__(self, cfg: Config, *, client: TelegramClient | None = None) -> None:
         if not cfg.tmux_session:
             raise ValueError("attach mode requires 'tmux_session' in config")
@@ -121,10 +238,17 @@ class AttachBridge:
         # the newest one (and re-detect if the session restarts). Claude Code uses a fixed path.
         self._transcript = self._resolve_transcript()
         self._last_resolve = 0.0
+        expected_agent_commands = _expected_agent_commands(cfg)
         self._session = TmuxSession([], name=cfg.tmux_session, cwd=Path.home(),
                                     origin_prefix=cfg.origin_prefix, boot_wait=0,
-                                    submit=("csi-u" if cfg.agent == "claude-code" else "enter"))
+                                    submit=("csi-u" if cfg.agent == "claude-code" else "enter"),
+                                    expected_agent_commands=expected_agent_commands)
         self._stop = threading.Event()
+        self._init_inbound_worker_state()
+        self._init_update_state()
+        # Voice-reply mode is persisted in the state dir (survives restart), not just memory.
+        self._voice_state_path = _state_dir(self.cfg) / "voice_mode"
+        self._voice_on = self._load_voice_state()
         # Persisted ledger of already-forwarded message uuids — survives restarts/crashes/reboots
         # so resuming an interrupted turn never re-sends what was already delivered.
         self._sent_path = Path.home() / ".config" / "agent2telegram" / "attach_sent.txt"
@@ -146,12 +270,14 @@ class AttachBridge:
         self._typing_count = 0                       # diagnostics: typing actions in current turn
         self._turn_started = 0.0                     # diagnostics: monotonic ts of turn start
         self._max_gap = 0.0                          # diagnostics: largest gap between typing actions
+        self._last_pane_warning = 0.0                # throttle unsafe-pane owner alerts
         # Persist the bubble's message_id so a restart/crash mid-turn can delete the orphan it
         # would otherwise leave behind in the chat.
         self._status_path = (self._signal.parent / "status_bubble") if self._signal else None
         self._seen_tools: set = set()
         self._tui_seen: set = set()          # Codex TUI scrape: tool lines already shown this turn
         self._turn_text_sent = False         # has any text been forwarded this turn (bubble gate)
+        self._turn_is_reaction = False       # turn opened by a reaction → exempt from the backstop
 
     # ---- transcript resolution --------------------------------------------
     def _codex_sessions_dir(self) -> Path:
@@ -167,6 +293,12 @@ class AttachBridge:
         files: list[str] = []
         for pat in (patterns or ("*.jsonl",)):
             files = glob.glob(str(base / "**" / pat), recursive=True)
+            # Claude Code writes subagent transcripts under "<conversation>/subagents/". A running
+            # subagent writes far more often than the main conversation, so on mtime it always
+            # wins the "newest" race — the bridge then tails the subagent and the summary the
+            # agent writes to the user is never forwarded. Reported by a user running an
+            # architect/tester/reviewer setup, where 17 of 21 transcripts were subagents.
+            files = [f for f in files if f"{os.sep}subagents{os.sep}" not in f]
             if files:
                 break
         if not files:
@@ -295,6 +427,30 @@ class AttachBridge:
 
     # ---- lifecycle ---------------------------------------------------------
     def run(self) -> None:
+        # Lock on the state dir. Two instances over one bot fight over getUpdates (409), both
+        # can inject the same update and both drain the same queue — messages then vanish and
+        # duplicate. The lock was written and tested in compat.py but never called (cross-review
+        # findings #3 / F3), so that protection was only on paper.
+        with self._instance_lock():
+            self._run_locked()
+
+    @contextmanager
+    def _instance_lock(self):
+        offset_path = getattr(self, "_offset_file", None)
+        if offset_path is None:
+            yield
+            return
+        try:
+            with single_instance_lock(Path(offset_path).parent / "bridge.lock"):
+                yield
+        except AlreadyRunning:
+            raise RuntimeError(
+                f"Another bridge instance is already running over the state at {Path(offset_path).parent}. "
+                "Two at once fight over messages — stop the other one, or give each its "
+                "own AGENT2TELEGRAM_STATE."
+            ) from None
+
+    def _run_locked(self) -> None:
         me = self.tg.get_me()
         log.info("Attach bridge live as @%s → tmux '%s', owner=%s",
                  me.get("username"), self.cfg.tmux_session, self._owner_chat)
@@ -349,17 +505,195 @@ class AttachBridge:
             self._tpos = last_user_end
             self._turn_from_tg = from_tg
 
-    def _mark_sent(self, uuid: str) -> None:
-        """Record a forwarded message uuid in memory and on disk (append-only ledger)."""
-        if not uuid or uuid in self._sent_keys:
-            return
+    def _mark_sent(self, uuid: str) -> bool:
+        """Record a delivered message uuid in memory and on disk. Returns whether the disk write
+        succeeded.
+
+        The return value matters: an `OSError` used to be swallowed silently, so the key stayed
+        only in memory. The caller then removed the record from the queue and after a restart the
+        SAME reply was sent again — a duplicate at exactly the moment the disk is full. A review
+        called the earlier write-order fix "only skin-deep"; it was right.
+        """
+        if not uuid:
+            return True
+        if uuid in self._sent_keys:
+            return True
         self._sent_keys.add(uuid)
         try:
             self._sent_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self._sent_path, "a", encoding="utf-8") as f:
                 f.write(uuid + "\n")
-        except OSError:
-            pass
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+        except OSError as e:
+            log.error("could not write the delivered-message ledger (%s) — keeping the record queued "
+                      "so the reply is not sent twice", e)
+            return False
+
+    # ---- inbound update persistence -----------------------------------------
+    def _init_update_state(self) -> None:
+        self._offset_file = _state_dir(self.cfg) / "offset"
+        self._processed_updates_file = _state_dir(self.cfg) / "processed_updates"
+        self._processed_update_ids, self._processed_update_order = self._read_processed_updates()
+
+    def _ensure_update_state(self) -> None:
+        # Focused tests may build the object without calling our __init__.
+        if not hasattr(self, "_offset_file"):
+            self._offset_file = _state_dir(self.cfg) / "offset"
+        if not hasattr(self, "_processed_updates_file"):
+            self._processed_updates_file = _state_dir(self.cfg) / "processed_updates"
+        if not hasattr(self, "_processed_update_ids") or not hasattr(self, "_processed_update_order"):
+            self._processed_update_ids, self._processed_update_order = self._read_processed_updates()
+        self._ensure_inbox()
+
+    def _ensure_inbox(self) -> DurableInbox | None:
+        """Durable inbox over the SAME directory the offset lives in — so state stays together
+        in tests and in production regardless of who assembled the object."""
+        inbox = getattr(self, "_inbox", None)
+        if inbox is None:
+            try:
+                inbox = DurableInbox(self._offset_file.parent)
+            except Exception as e:                     # must not break message intake
+                log.error("could not open the durable inbox: %s", e)
+                inbox = None
+            self._inbox = inbox
+        return inbox
+
+    def _load_offset(self) -> int:
+        self._ensure_update_state()
+        try:
+            return int(json.loads(self._offset_file.read_text("utf-8"))["offset"])
+        except Exception:
+            return 0
+
+    def _save_offset(self, offset: int) -> None:
+        self._ensure_update_state()
+        try:
+            self._offset_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._offset_file.parent / (self._offset_file.name + ".tmp")
+            tmp.write_text(json.dumps({"offset": int(offset)}), encoding="utf-8")
+            tmp.replace(self._offset_file)
+        except OSError as e:
+            log.warning("could not persist attach offset: %s", e)
+
+    def _read_processed_updates(self) -> tuple[set[int], deque[int]]:
+        ids: set[int] = set()
+        order: deque[int] = deque()
+        try:
+            raw = json.loads(self._processed_updates_file.read_text("utf-8")).get("update_ids", [])
+        except Exception:
+            raw = []
+        for value in raw[-PROCESSED_UPDATE_LEDGER_LIMIT:]:
+            try:
+                update_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if update_id not in ids:
+                ids.add(update_id)
+                order.append(update_id)
+        return ids, order
+
+    def _persist_processed_updates(self) -> None:
+        self._ensure_update_state()
+        try:
+            self._processed_updates_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._processed_updates_file.parent / (self._processed_updates_file.name + ".tmp")
+            data = {"update_ids": list(self._processed_update_order)}
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(self._processed_updates_file)
+        except OSError as e:
+            log.warning("could not persist processed updates: %s", e)
+
+    def _mark_update_processed(self, update_id: int | None) -> None:
+        if update_id is None:
+            return
+        self._ensure_update_state()
+        try:
+            update_id = int(update_id)
+        except (TypeError, ValueError):
+            return
+        if update_id in self._processed_update_ids:
+            return
+        self._processed_update_ids.add(update_id)
+        self._processed_update_order.append(update_id)
+        while len(self._processed_update_order) > PROCESSED_UPDATE_LEDGER_LIMIT:
+            old = self._processed_update_order.popleft()
+            self._processed_update_ids.discard(old)
+        self._persist_processed_updates()
+
+    def _update_was_processed(self, update_id: int | None) -> bool:
+        if update_id is None:
+            return False
+        self._ensure_update_state()
+        try:
+            return int(update_id) in self._processed_update_ids
+        except (TypeError, ValueError):
+            return False
+
+    def _handle_update_once(self, upd: dict, offset: int) -> int:
+        raw_id = upd.get("update_id")
+        try:
+            update_id = int(raw_id)
+        except (TypeError, ValueError):
+            log.warning("skipping malformed Telegram update without a valid update_id: %r", upd)
+            return offset
+        next_offset = max(offset, update_id + 1) if update_id is not None else offset
+        if update_id is not None and update_id < offset:
+            return offset
+        if self._update_was_processed(update_id):
+            self._save_offset(next_offset)
+            return next_offset
+
+        # ORDER IS CRITICAL. Telegram treats an update as handled the moment we ask for a higher
+        # offset — it never resends it. The offset used to advance before the message reached
+        # anywhere durable (it only sat in the in-memory queue), so a crash in that window erased
+        # it. A monitor was killing the bridge several times a day, so this was not theoretical.
+        #
+        # Now: write to disk first, ACK only after. If the write fails the offset does NOT
+        # advance and Telegram resends the message — better twice than never.
+        inbox = self._ensure_inbox()
+        if inbox is None:
+            # Without durable storage the offset must NOT advance. This case used to fall through
+            # to the old lossy path — exactly when the disk is full or corrupt and durability is
+            # needed most (review finding #2).
+            log.error("update %s: durable storage unavailable, not advancing the offset", update_id)
+            return offset
+        try:
+            record_id = inbox.reserve(upd)
+        except Exception as e:
+            log.error("could not store update %s, not advancing the offset: %s", update_id, e)
+            return offset
+        self._save_offset(next_offset)
+        # The POLLER must send the receipt ACK, not the worker: the worker handles messages one
+        # at a time, so a second message only gets its turn after the first finishes — the ACK
+        # would arrive late and useless. Confirmed live: in the original form it never arrived.
+        self._maybe_ack_queued(upd)
+        # Log EVERY accepted incoming message. Without this, "I wrote and nothing happened"
+        # cannot be answered from the log: there was no record that the message ever arrived
+        # (gap found 2026-08-02). Content is truncated and never includes attachments' bytes.
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        if msg.get("voice") or msg.get("audio"):
+            kind = "voice"
+        elif msg.get("photo") or msg.get("document"):
+            kind = "file"
+        elif upd.get("message_reaction"):
+            kind = "reaction"
+        else:
+            kind = "text"
+        preview = (msg.get("text") or msg.get("caption") or "").replace("\n", " ")[:40]
+        # Whether it was a reply to a specific message matters for later diagnosis: the agent
+        # gets that context, so the log must show it too (otherwise the two cannot be matched up).
+        replied_to = msg.get("reply_to_message") or {}
+        quoted = (replied_to.get("text") or replied_to.get("caption") or "").replace("\n", " ")[:30]
+        if quoted:
+            log.info("IN  id=%s update=%s kind=%s reply_to=%r %r",
+                     record_id, update_id, kind, quoted, preview)
+        else:
+            log.info("IN  id=%s update=%s kind=%s %r", record_id, update_id, kind, preview)
+        self._submit_inbound_update(upd, record_id)
+        self._mark_update_processed(update_id)
+        return next_offset
 
     # ---- durable outbound delivery (never drop a reply) --------------------
     def _load_queue(self) -> list:
@@ -388,35 +722,176 @@ class AttachBridge:
         except OSError:
             pass
 
-    def _enqueue(self, text: str, key: str | None) -> None:
-        self._pending_send.append({"text": text, "key": key})
+    def _enqueue(self, text: str, key: str | None, *, turn_text: bool = True) -> None:
+        item = {"text": text, "key": key}
+        if not turn_text:
+            item["turn_text"] = False
+        self._pending_send.append(item)
         self._persist_queue()
+        if turn_text:
+            self._turn_text_sent = True
 
-    def _send_final(self, text: str, key: str | None = None) -> None:
+    def _send_final(self, text: str, key: str | None = None, *, turn_text: bool = True) -> None:
         """Forward one reply RELIABLY. Marks the dedup ledger only AFTER a confirmed send; on any
         send failure the reply is queued to disk and the outbound loop keeps retrying until Telegram
         confirms. Order is preserved: if anything is already queued, this appends behind it."""
-        if not text or self._owner_chat is None:
+        if self._owner_chat is None or (not text and not getattr(self, "_pending_files", None)):
             return
         if key and key in self._sent_keys:
             return
+        # Voice-reply mode: speak the reply as a Telegram voice note. Best-effort ENHANCEMENT —
+        # a too-long reply or ANY failure falls straight through to the durable TEXT path below,
+        # so voice mode can NEVER make a reply not arrive (that is the whole point of v2).
+        if (turn_text and text and self._voice_reply_on()
+                and not (self.cfg.file_marker and self.cfg.file_marker.lower() in text.lower())):
+            if len(text) > VOICE_MAX_CHARS:
+                text = f"{text}\n\n🗣️→📝 (too long to read aloud — sent as text)"
+            elif self._try_send_voice(text):
+                if key:
+                    self._mark_sent(key)
+                self._turn_text_sent = True
+                return
+            else:
+                text = f"🗣️→📝 (voice unavailable — sent as text)\n{text}"
+        # `[tg-file] <path>` lines are attachments, not content — pull them out, send the
+        # text first, then upload. Without this the agent had to bypass the bridge with a
+        # raw curl, which is exactly what we do not want (markdown broke, [tg] leaked).
+        if self.cfg.file_marker and self.cfg.file_marker.lower() in text.lower():
+            text, files = self._extract_files(text)
+            if files:
+                self._pending_files = getattr(self, "_pending_files", []) + files
+            if not text and self._ensure_outbox() is None:
+                # Only without the durable queue do we take the old path. EVERY attachment-only
+                # reply used to slip through here: _flush_files clears the path from memory before
+                # the upload, so a network failure lost the attachment (review finding #6).
+                self._flush_files()
+                return
+        # The durable outbox tracks EACH PART separately. Previously a failure re-queued the
+        # WHOLE text, so already-delivered parts arrived a second time — the user saw duplicated
+        # opening paragraphs of long replies (finding D; found independently in two reviews).
+        # Attachments weren't queued at all and vanished on restart (finding F).
+        outbox = self._ensure_outbox()
+        if outbox is not None:
+            chunks = split_message(text) if text else []
+            files = list(getattr(self, "_pending_files", []) or [])
+            try:
+                outbox.enqueue(chunks, files, key)
+            except Exception as e:
+                log.error("could not persist the outgoing reply, falling back to the old path: %s", e)
+            else:
+                self._pending_files = []
+                if turn_text:
+                    # For the backstop the reply is handled once it is durably stored.
+                    # Waiting for Telegram would, during an outage, create a second identical record.
+                    self._turn_text_sent = True
+                return
+
         if self._pending_send:                       # something already waiting → keep FIFO order
-            self._enqueue(text, key)
+            self._enqueue(text, key, turn_text=turn_text)
             return
         try:
             self.tg.send_message(self._owner_chat, text)
         except Exception as e:                        # network reset, 5xx after retries, etc.
             log.warning("forward failed → queued for re-delivery: %s", e)
-            self._enqueue(text, key)
+            self._enqueue(text, key, turn_text=turn_text)
             return
         if key:
             self._mark_sent(key)
-        self._turn_text_sent = True
-        log.info("FWD (send) %r", text[:30])
+        if turn_text:
+            self._turn_text_sent = True
+        log.info("FWD (send, legacy path) %r", text[:40].replace("\n", " "))
+        self._flush_files()
+
+    def _ensure_outbox(self) -> "DurableOutbox | None":
+        # Attach mode only. StreamBridge shares this code but has its own queue alongside the
+        # configs and a different lifecycle — switching it without a spec change would be an
+        # unrequested behaviour change (and its test correctly caught that).
+        if not getattr(self, "_use_durable_outbox", False):
+            return None
+        outbox = getattr(self, "_outbox", None)
+        if outbox is None:
+            queue_path = getattr(self, "_queue_path", None)
+            if queue_path is None and _in_test_run() and not os.environ.get("AGENT2TELEGRAM_STATE"):
+                # HARD STOP. A test that forgets to isolate its queue would otherwise enqueue into
+                # the SHARED state directory, and the live bridge — a different process watching
+                # that same queue — delivers it to the real chat. That is not hypothetical: on
+                # 2026-08-23 a test run sent eleven fixture strings ("the real answer", "thanks!")
+                # straight to a real chat. A test must never be able to do that, so the outbox
+                # refuses the default path instead of trusting every test to opt out.
+                log.error("durable outbox refused: test run without an isolated queue "
+                          "(set _queue_path or AGENT2TELEGRAM_STATE)")
+                return None
+            root = Path(queue_path).parent if queue_path is not None else _state_dir(self.cfg)
+            # OWN subdirectory, not the state root. DurableOutbox creates an "outbox" folder
+            # under the root it is given — but `<state>/outbox` is ALSO the folder user
+            # attachments are sent from (Config.path_outbox). Real files were sitting there;
+            # without this separation the queue would count them against its quota, move the
+            # foreign .json files to dead-letter and delete them after 90 days. The single
+            # destructive finding of the review round, caught just before the switch.
+            try:
+                outbox = DurableOutbox(root / "queue")
+            except Exception as e:                     # delivery must not stop
+                log.error("could not open the durable outbox: %s", e)
+                outbox = None
+            self._outbox = outbox
+        return outbox
 
     def _flush_pending(self) -> None:
-        """Re-send queued replies FIFO until one fails (then stop, preserving order for next pass).
-        Called every outbound cycle, so a transient network failure self-heals within ~0.4 s."""
+        """Deliver the queue FIFO, stopping at the first failure to preserve order. Called every
+        outbound cycle, so a network hiccup self-heals within one tick."""
+        outbox = self._ensure_outbox()
+        while outbox is not None and self._owner_chat is not None:
+            rec = outbox.head()
+            if rec is None:
+                break
+            # Parts already confirmed by Telegram are NOT resent — only the remaining ones.
+            for index, chunk in rec.pending_chunks:
+                try:
+                    self.tg.send_message(self._owner_chat, chunk)
+                except Exception as e:
+                    log.warning("delivery of part %d still failing: %s", index, e)
+                    return
+                outbox.mark_chunk_sent(rec.record_id, index)
+            vzdano = False
+            for file_path in rec.pending_files:
+                try:
+                    self._send_one_file(file_path)
+                except Exception as e:
+                    # Bounded retries: without them one bad attachment (over the size limit,
+                    # a deleted file, HTTP 400) would hold the head of the FIFO queue forever
+                    # and NO further reply would reach the user (finding F2).
+                    attempts = outbox.fail(rec.record_id, f"{file_path}: {e}")
+                    log.warning("delivery of attachment %s failed (%d/%d): %s",
+                                file_path, attempts, OUTBOX_MAX_ATTEMPTS, e)
+                    if attempts >= OUTBOX_MAX_ATTEMPTS:
+                        # mark_file_sent must NOT be used: it would record that the attachment
+                        # arrived when it did not — a silent loss, exactly what this project
+                        # removes. An earlier form of this fix did that; caught in the third
+                        # review round. The whole record goes to dead-letter: it leaves the queue
+                        # (so it does not clog it) but stays traceable, including which parts
+                        # did get delivered.
+                        self._report_permanent_refusal(Path(file_path).name, str(e))
+                        outbox.give_up(rec.record_id, f"attachment {file_path}: {e}")
+                        log.error("attachment %s gave up after %d attempts → dead-letter",
+                                  file_path, attempts)
+                        vzdano = True
+                        break
+                    return
+                outbox.mark_file_sent(rec.record_id, file_path)
+            if vzdano:
+                continue          # the record is in dead-letter, the queue moves on
+            if rec.key and not self._mark_sent(rec.key):
+                # The ledger write failed → the record STAYS in the queue. Delivered parts are
+                # marked, so they are not resent; the next cycle just tries to finish it.
+                return
+            outbox.done(rec.record_id)
+            # The record id and a text preview are logged ON PURPOSE: on 2026-08-01 the user
+            # received one reply twice and the log could not tell whether it was the same
+            # message delivered twice or two different ones. Without that, any fix is a guess.
+            preview = (rec.chunks[0][:40] if rec.chunks else "(files only)").replace("\n", " ")
+            log.info("FWD (delivered) id=%s %d parts, %d attachments %r",
+                     rec.record_id, len(rec.chunks), len(rec.files), preview)
+
         while self._pending_send and self._owner_chat is not None:
             item = self._pending_send[0]
             try:
@@ -428,13 +903,139 @@ class AttachBridge:
             self._persist_queue()
             if item.get("key"):
                 self._mark_sent(item["key"])
-            self._turn_text_sent = True
             log.info("FWD (re-delivered) %r", str(item.get("text", ""))[:30])
 
     # ---- inbound (Telegram → session) -------------------------------------
+    def _init_inbound_worker_state(self) -> None:
+        self._inbound_queue = queue.Queue()
+        self._inbound_worker_started = False
+        self._inbound_worker_lock = threading.Lock()
+
+    def _ensure_inbound_worker_state(self) -> None:
+        # Focused tests may construct the object without AttachBridge.__init__.
+        if not hasattr(self, "_inbound_queue"):
+            self._inbound_queue = queue.Queue()
+        if not hasattr(self, "_inbound_worker_started"):
+            self._inbound_worker_started = False
+        if not hasattr(self, "_inbound_worker_lock"):
+            self._inbound_worker_lock = threading.Lock()
+
+    def _start_inbound_worker(self) -> None:
+        self._ensure_inbound_worker_state()
+        with self._inbound_worker_lock:
+            if self._inbound_worker_started:
+                return
+            threading.Thread(target=self._inbound_worker_loop, daemon=True).start()
+            self._inbound_worker_started = True
+
+    def _submit_inbound_update(self, upd: dict, record_id: str | None = None) -> None:
+        self._start_inbound_worker()
+        if record_id:
+            self._inbound_inflight().add(record_id)
+        self._inbound_queue.put((upd, record_id))
+
+    def _inbound_inflight(self) -> set:
+        """Records currently in flight in the in-memory queue. Without this bookkeeping a
+        retry would enqueue the same message again and the user would receive it twice."""
+        if not hasattr(self, "_inflight_ids"):
+            self._inflight_ids = set()
+        return self._inflight_ids
+
+    def _replay_pending_inbound(self) -> int:
+        """After startup, deliver messages left in durable storage.
+
+        Without this, durability was only half done: a message was stored on disk but nobody ever
+        took it from there — Telegram won't resend it, so it would sit until retention expired.
+        Found independently in two cross-reviews.
+        """
+        inbox = self._ensure_inbox()
+        if inbox is None:
+            return 0
+        try:
+            waiting = inbox.pending()
+        except Exception as e:
+            log.error("could not read the leftover inbound messages: %s", e)
+            return 0
+        in_flight = self._inbound_inflight()
+        waiting = [r for r in waiting if r.record_id not in in_flight]
+        for rec in waiting:
+            self._submit_inbound_update(rec.update, rec.record_id)
+        if waiting:
+            log.info("delivering %d message(s) left over from before restart", len(waiting))
+        return len(waiting)
+
+    def _inbound_worker_loop(self) -> None:
+        """Process accepted Telegram updates FIFO outside the long-poll thread.
+
+        Media download and STT retries can take minutes; keeping them here prevents one slow voice
+        note from blocking getUpdates while preserving message order for the owner.
+        """
+        while not self._stop.is_set() or not self._inbound_queue.empty():
+            try:
+                item = self._inbound_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            upd, record_id = item if isinstance(item, tuple) else (item, None)
+            try:
+                delivered = self._handle(upd)
+            except Exception as e:
+                log.exception("inbound worker error: %s", e)
+                self._inbound_failed(record_id, str(e))
+            else:
+                # `_handle` returns False when the message never reached the session. Both cases
+                # used to just call task_done and the message vanished — that is audit finding B.
+                if delivered is not False:
+                    log.info("IN  delivered to session id=%s", record_id)
+                if delivered is False:
+                    self._inbound_failed(record_id, "not delivered to the session")
+                else:
+                    self._inbound_done(record_id)
+            finally:
+                self._inbound_queue.task_done()
+
+    def _inbound_done(self, record_id: str | None) -> None:
+        # ORDER MATTERS. Removing the record from the in-flight set BEFORE deleting it from the
+        # inbox leaves a window where it is "not in flight" and still "pending on disk" — and a
+        # concurrent _replay_pending_inbound() lands exactly there and submits the message a
+        # SECOND time. The user gets the same message twice. Caught by CI, where the timing
+        # differs enough for the window to be hit.
+        #
+        # Deleting from the inbox first closes it: while the delete runs the record still counts
+        # as in flight (so replay skips it), and once it is gone replay cannot see it at all.
+        inbox = getattr(self, "_inbox", None)
+        try:
+            if record_id and inbox is not None:
+                inbox.done(record_id)
+        except Exception as e:
+            log.warning("cleanup of delivered record %s failed: %s", record_id, e)
+        finally:
+            # Always release the id, even if the delete failed — otherwise it stays marked in
+            # flight forever and the message can never be retried.
+            self._inbound_inflight().discard(record_id)
+
+    def _inbound_failed(self, record_id: str | None, reason: str) -> None:
+        """Not delivered → the record stays and is retried. After the attempts are exhausted it
+        goes to dead-letter, so the message never vanishes without a trace even in a hopeless case."""
+        self._inbound_inflight().discard(record_id)
+        inbox = getattr(self, "_inbox", None)
+        if not record_id or inbox is None:
+            return
+        try:
+            attempts = inbox.fail(record_id, reason)
+            if attempts >= INBOUND_MAX_ATTEMPTS:
+                inbox.give_up(record_id, f"{reason} (after {attempts} attempts)")
+                log.error("update %s could not be delivered even on attempt %d → dead-letter",
+                          record_id, attempts)
+        except Exception as e:
+            log.warning("marking undelivered record %s failed: %s", record_id, e)
+
     def _inbound_loop(self) -> None:
-        offset = 0
+        self._start_inbound_worker()
+        self._replay_pending_inbound()   # clear the backlog first, then new messages
+        offset = self._load_offset()
         allowed_updates = json.dumps(["message", "edited_message", "message_reaction"])
+        transient_fails = 0
+        outage_alerted = False
         while not self._stop.is_set():
             try:
                 updates = self.tg._call(
@@ -443,38 +1044,79 @@ class AttachBridge:
                      "allowed_updates": allowed_updates},
                     timeout=self.cfg.poll_timeout + 15,
                 )
-            except Exception as e:
-                log.error("getUpdates failed: %s", e)
+            except (TelegramError, OSError) as e:
+                if is_network_error(e):
+                    # Transient network/DNS problem (Errno 8 "nodename nor servname", connection
+                    # reset, timeout) — the bridge recovers on its own. WARNING + backoff; ERROR
+                    # only ONCE during a longer outage, so monitoring doesn't alert on a
+                    # self-healing VPN/DNS blip.
+                    transient_fails += 1
+                    if transient_fails >= 10 and not outage_alerted:
+                        log.error("getUpdates network outage (%d in a row) is lasting: %s",
+                                  transient_fails, e)
+                        outage_alerted = True
+                    else:
+                        log.warning("getUpdates transient network error (%d): %s", transient_fails, e)
+                    self._stop.wait(min(3 * transient_fails, 30))
+                    continue
+                log.error("getUpdates failed: %s", e)   # a real (non-network) error
                 self._stop.wait(3)
                 continue
+            if outage_alerted:
+                log.info("getUpdates network recovered after %d errors", transient_fails)
+            transient_fails = 0
+            outage_alerted = False
             for upd in updates:
-                offset = max(offset, upd["update_id"] + 1)
                 try:
-                    self._handle(upd)
+                    offset = self._handle_update_once(upd, offset)
                 except Exception as e:
                     log.exception("inbound error: %s", e)
 
-    def _handle(self, upd: dict) -> None:
+    def _handle(self, upd: dict) -> bool:
+        """Handle one update. Returns False ONLY when the message was not delivered to the session.
+
+        The return value drives the durable inbox: True = handled, the record may go; False = not
+        delivered, the record stays and is retried. So every "nothing to do" branch returns True —
+        retrying them is pointless. False comes solely from a failed write to tmux, exactly what
+        retrying cures.
+        """
         # Reactions (e.g. ❤️) → quick-feedback line.
         mr = upd.get("message_reaction")
         if mr:
             if mr.get("user", {}).get("id") not in self._allowed:
-                return
+                return True
             emojis = "".join(r.get("emoji", "") for r in mr.get("new_reaction", [])
                              if r.get("type") == "emoji")
             if emojis:
-                self._inject(f"{emojis} reacted {emojis} to your message #{mr.get('message_id')} "
-                             f"— quick feedback; no need to reply unless relevant.")
-            return
+                # A reaction DOES deserve an answer, but a one-liner — being left on read feels
+                # like the bridge swallowed it. The prompt therefore asks for a very short reply.
+                #
+                # The backstop exemption below is the safety net for when the agent still stays
+                # silent. Without it the backstop ("a Telegram turn must never go unanswered")
+                # grabs the last assistant text and can forward an INTERNAL note — that is how
+                # "No response requested." reached a user on a live bridge (2026-08-02). Silence
+                # is the lesser evil; the log line in _finish_turn keeps it visible.
+                # Only when no turn was running: a reaction landing mid-turn must not disarm the
+                # backstop for the real question underneath it.
+                turn_running = self._turn_active.is_set()
+                self._begin_turn()
+                if not turn_running:
+                    self._turn_is_reaction = True
+                return self._inject(
+                    f"{emojis} reacted {emojis} to your message #{mr.get('message_id')} "
+                    f"— quick feedback. Always answer, but with ONE very short line "
+                    f"(a few words or an emoji), nothing more.")
+            return True
 
         msg = upd.get("message") or upd.get("edited_message")
         if not msg:
-            return
+            return True
         user_id = msg.get("from", {}).get("id")
         chat_id = msg["chat"]["id"]
         if user_id not in self._allowed:
             self.tg.send_message(chat_id, "⛔ Not authorized.")
-            return
+            return True
+
 
         # Bridge-level slash commands (e.g. /start, /help) are answered here instead of being
         # forwarded to the agent — so the first contact is a friendly intro, not the agent
@@ -483,23 +1125,113 @@ class AttachBridge:
         if text0.startswith("/") and not (msg.get("voice") or msg.get("audio")
                                            or msg.get("photo") or msg.get("document")):
             if self._handle_command(text0, chat_id, msg.get("message_id")):
-                return
+                return True
 
-        # Light "typing…" from the very first moment — including the voice-transcription /
-        # file-download window (seconds), so the indicator never has a gap at the start.
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        if msg.get("voice") or msg.get("audio"):
+            # Transcription and download do their own retries and report errors to the user
+            # themselves, so we don't loop here — an external retry would just pay for STT again.
+            text = self._transcribe(msg.get("voice") or msg.get("audio"), chat_id) or text
+            if not text:
+                return True
+            # The agent MUST know it is reading a machine transcript, not written text. Without
+            # this it treats the transcript as verbatim and, on an error, sees nonsense instead
+            # of a mis-recognition: a voice note once transcribed into the wrong language entirely
+            # and the agent insisted it had arrived exactly as sent. With this marker it can guess
+            # from context instead.
+            text = f"[voice transcript – may contain recognition errors]\n{text}"
+        elif msg.get("photo") or msg.get("document"):
+            note = self._download_note(msg, chat_id)
+            if not note:
+                return True
+            text = f"{text}\n{note}".strip()
+        if text:
+            text = self._prepend_reply_context(msg, text)
+            if self._voice_reply_on():
+                # Tell the agent to write for the EAR, not the eye. This is the core of voice
+                # mode — the model phrases speakable text far better than any post-processing.
+                text = f"{VOICE_MODE_HINT}\n{text}"
+            text = self._limit_inbound_prompt(text, chat_id)
+            if not text:
+                return True
+            self._begin_turn()
+            return self._inject(text)
+        return True
+
+    def _prepend_reply_context(self, msg: dict, text: str) -> str:
+        """When the user replies to a specific message, tell the agent which one.
+
+        Without this the agent gets only the bare text and has to guess from context. For a
+        terse "fix this" under an automated notice it is impossible to guess. The marker is in
+        English because the tool writes it, not the agent.
+        """
+        replied_to = msg.get("reply_to_message") or {}
+        quote = (replied_to.get("text") or replied_to.get("caption") or "").strip()
+        if not quote:
+            return text
+        quote = " ".join(quote.split())
+        if len(quote) > REPLY_QUOTE_CHARS:
+            quote = quote[:REPLY_QUOTE_CHARS] + "…"
+        return f"[replying to: {quote}]\n{text}"
+
+    def _maybe_ack_queued(self, upd: dict) -> None:
+        """Acknowledge a message that arrived while work was already in progress.
+
+        The notice text is ENGLISH even when the conversation is in another language: the bridge
+        itself writes this, not the agent, and the bridge is a tool for anyone (it gets installed
+        for other people). The agent's own replies of course follow the conversation's language —
+        this is the one place the tool itself speaks.
+        """
+        if not self._turn_active.is_set():
+            log.debug("ACK not sent: no turn in progress")
+            return
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        if msg.get("from", {}).get("id") not in self._allowed:
+            return
+        chat_id = (msg.get("chat") or {}).get("id")
+        if chat_id is None:
+            return
+        ted = time.monotonic()
+        # MIND the default: `time.monotonic()` counts from SYSTEM start, so on a long-running
+        # macOS it is a large number, but on a freshly booted Linux (container, server restart)
+        # nearly zero. With a 0.0 default no ACK would be sent for the first 30 seconds there.
+        # So None = "never yet", not zero.
+        posledni = getattr(self, "_last_queue_ack", None)
+        if posledni is not None and ted - posledni < QUEUE_ACK_COOLDOWN:
+            return
+        self._last_queue_ack = ted
+        try:
+            self.tg.send_message(chat_id, "⚡ Got your message. I'll get to it as soon as "
+                                          "I finish what I'm on.")
+            # Must log: without a record you can't tell after an incident whether the ACK went
+            # out. It was once impossible to decide whether the feature even worked.
+            log.info("receipt ACK sent (another turn is running)")
+        except Exception as e:
+            log.warning("could not send the receipt ACK: %s", e)
+
+    def _begin_turn(self) -> None:
+        # Light "typing…" from the actual injection point.
         self._consume_turn_end()                 # drop any stale end-marker from a prior turn
         now = time.monotonic()
         self._turn_active.set()
+        self._turn_from_tg = True
         self._last_activity = now
         self._turn_started = now
         self._typing_count = 1
         self._max_gap = 0.0
         self._last_typing = now
         self._turn_text_sent = False             # gate TUI bubbles until intro text lands
+        self._turn_is_reaction = False           # set by the reaction branch right after this
+        # Clear any end-of-turn signal left over from the PREVIOUS turn. Codex writes
+        # task_complete to the rollout with a delay, so a late one could land after the next
+        # turn had already started and end it within ~1 s — the reply was then never sent and
+        # the backstop never fired (2026-08-02: a voice note answered with silence).
+        self._pending_turn_end = False
+        self._turn_begun_at = now
         # Seed the TUI dedup with tool lines ALREADY on screen from previous turns, so the
         # scraper only emits calls that appear DURING this turn — otherwise stale lines still
         # visible in the pane get re-sent as bubbles under the new turn.
-        if self.cfg.agent == "codex":
+        if self.cfg.agent == "codex" and hasattr(self, "_session"):
             try:
                 self._tui_seen = set(_extract_tui_tools(self._session._capture()))
             except Exception:
@@ -509,25 +1241,81 @@ class AttachBridge:
         self.tg.send_chat_action(self._owner_chat, "typing")   # instant, don't wait for the loop
         log.info("TURN START t=%.2f", time.time())
 
-        text = (msg.get("text") or msg.get("caption") or "").strip()
-        if msg.get("voice") or msg.get("audio"):
-            text = self._transcribe(msg.get("voice") or msg.get("audio"), chat_id) or text
-            if not text:
-                return
-        elif msg.get("photo") or msg.get("document"):
-            note = self._download_note(msg, chat_id)
-            text = f"{text}\n{note}".strip() if note else text
-        if text:
-            self._inject(text)
+    def _inject(self, text: str) -> bool:
+        """Deliver a message to the session. A failure must NEVER be silent.
 
-    def _inject(self, text: str) -> None:
+        Previously a failed write to tmux was only logged and the message vanished — the user
+        learned nothing. Seen in production:
+            19:04:41 ERROR inject failed: '[TG] are you there?' timed out after 10 seconds
+        The user sent that message and never got a reply; no trace was left of it.
+
+        A write to tmux can fail transiently (busy pane, full buffer), so it is retried. When
+        even the retries don't help, the user has to be told.
+        """
         self._turn_active.set()
         self._last_activity = time.monotonic()   # keep typing lit from the very start
+        last_error: Exception | None = None
+        for attempt in range(1, INJECT_ATTEMPTS + 1):
+            try:
+                self._session.inject(text)
+                if attempt > 1:
+                    log.info("inject succeeded on attempt %d", attempt)
+                return True
+            except SessionError as e:
+                last_error = e
+                if "refusing to inject" in str(e):
+                    # The pane isn't running the expected agent — retrying won't help, only delay.
+                    log.error("inject failed: %s", e)
+                    self._turn_active.clear()
+                    self._notify_unsafe_pane(str(e))
+                    return False
+            except Exception as e:
+                last_error = e
+            if attempt < INJECT_ATTEMPTS:
+                self._stop.wait(INJECT_RETRY_WAIT)
+        log.error("inject failed after %d attempts: %s", INJECT_ATTEMPTS, last_error)
+        self._turn_active.clear()
+        self._notify_inject_failed(text, str(last_error))
+        return False
+
+    def _notify_inject_failed(self, text: str, reason: str) -> None:
+        """Tell the owner their message did not get through — better twice than never."""
+        if not self._owner_chat:
+            return
+        preview = text.strip().replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:80] + "…"
         try:
-            self._session.inject(text)
+            self.tg.send_message(
+                self._owner_chat,
+                "⚠️ Couldn't deliver your message to the agent session — the write to tmux "
+                f"failed after {INJECT_ATTEMPTS} attempts.\n\n"
+                f"Message: {preview}\n{reason}\n\n"
+                "The agent may be frozen. Check the tmux pane, then send it again.",
+            )
+            # Log it: without this the daily report sees "N injects failed" but cannot tell
+            # whether the user was ever told. That is the exact blind spot delivery logging
+            # was added to close (2026-08-04).
+            log.info("inject failure reported to the owner %r", preview[:40])
         except Exception as e:
-            log.error("inject failed: %s", e)
-            self._turn_active.clear()
+            log.warning("inject-failure notification failed: %s", e)
+
+    def _notify_unsafe_pane(self, reason: str) -> None:
+        if not self._owner_chat:
+            return
+        now = time.monotonic()
+        if now - self._last_pane_warning < 60:
+            return
+        self._last_pane_warning = now
+        try:
+            self.tg.send_message(
+                self._owner_chat,
+                "⚠️ Agent2Telegram blocked a Telegram message because the configured tmux "
+                f"session no longer appears to be running the expected agent.\n\n{reason}\n\n"
+                "Restart the agent in that tmux pane, then resend the message.",
+            )
+        except Exception as e:
+            log.warning("unsafe-pane owner notification failed: %s", e)
 
     def _handle_command(self, text: str, chat_id: int, message_id: int | None = None) -> bool:
         """Answer a bridge-level slash command. Returns True if handled (don't forward to agent)."""
@@ -544,20 +1332,101 @@ class AttachBridge:
                 "progress, what tools it runs, and the reply. You can also send *photos* and "
                 "*files*, and react with ❤️ as quick feedback.\n\n"
                 f"🎤 Voice transcription: {voice}.\n\n"
-                "Commands: /help · /status · /id · /setkey")
+                "Commands: /help · /status · /id · /setkey · /voice")
             return True
         if cmd == "id":
             self.tg.send_message(chat_id, f"Your Telegram id: `{chat_id}`")
             return True
         if cmd == "status":
             voice = "✓" if self.cfg.elevenlabs_api_key else "✗"
+            replies = "🔊 on" if self._voice_reply_on() else "🔇 off"
             self.tg.send_message(chat_id,
                 f"✅ Connected — *{agent}* in tmux session `{self.cfg.tmux_session}`.\n"
-                f"🎤 Voice (ElevenLabs): {voice}")
+                f"🎤 Voice transcription (ElevenLabs): {voice}\n"
+                f"🗣️ Voice replies (/voice): {replies}")
             return True
         if cmd == "setkey":
             return self._set_voice_key(arg, chat_id, message_id)
+        if cmd == "voice":
+            return self._toggle_voice(chat_id)
         return False    # unknown command → let the agent handle it
+
+    # ---- voice-reply mode ----------------------------------------------------
+    def _load_voice_state(self) -> bool:
+        try:
+            return self._voice_state_path.read_text("utf-8").strip() == "on"
+        except OSError:
+            return False
+
+    def _voice_reply_on(self) -> bool:
+        """Voice replies only when the switch is on AND a key exists to actually synthesize."""
+        return bool(getattr(self, "_voice_on", False) and self.cfg.elevenlabs_api_key)
+
+    def _set_voice_state(self, on: bool) -> None:
+        self._voice_on = on
+        try:
+            self._voice_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._voice_state_path.parent / (self._voice_state_path.name + ".tmp")
+            tmp.write_text("on" if on else "off", encoding="utf-8")
+            tmp.replace(self._voice_state_path)          # atomic persist
+        except OSError as e:
+            log.warning("could not persist voice-mode state: %s", e)
+
+    def _try_send_voice(self, text: str) -> bool:
+        """Render *text* to a Telegram voice note (ElevenLabs → mp3 → OGG/OPUS via ffmpeg →
+        sendVoice). Returns True on success; on ANY failure returns False so the caller falls
+        back to durable text. Never raises — voice must not break delivery."""
+        key = self.cfg.elevenlabs_api_key
+        if not key:
+            return False
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            log.warning("voice reply skipped: ffmpeg not on PATH")
+            return False
+        try:
+            spoken = tts.sanitize_for_speech(text)            # rough safety net only
+            mp3 = tts.synthesize(spoken, api_key=key, voice_id=self.cfg.tts_voice_id,
+                                 model_id=self.cfg.tts_model_id)
+        except Exception as e:
+            log.warning("voice reply TTS failed: %s", e)
+            return False
+        tmpdir = tempfile.mkdtemp(prefix="a2t_voice_")
+        try:
+            mp3_path = os.path.join(tmpdir, "reply.mp3")
+            ogg_path = os.path.join(tmpdir, "reply.ogg")
+            with open(mp3_path, "wb") as fh:
+                fh.write(mp3)
+            # OGG/OPUS is what Telegram wants for a real voice bubble; other formats become a
+            # plain audio attachment. No shell.
+            r = subprocess.run(
+                [ffmpeg, "-y", "-i", mp3_path, "-c:a", "libopus", "-b:a", "32k", ogg_path],
+                capture_output=True, timeout=60,
+            )
+            if r.returncode != 0 or not os.path.exists(ogg_path) or os.path.getsize(ogg_path) == 0:
+                log.warning("voice reply ffmpeg conversion failed (rc=%s)", r.returncode)
+                return False
+            self.tg.send_voice(self._owner_chat, ogg_path)
+            log.info("FWD (voice) %r", text[:30])
+            return True
+        except Exception as e:
+            log.warning("voice reply send failed: %s", e)
+            return False
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _toggle_voice(self, chat_id: int) -> bool:
+        if not self.cfg.elevenlabs_api_key:
+            self.tg.send_message(chat_id,
+                "🔊 Voice replies need an ElevenLabs key first. Add one with /setkey, then /voice.")
+            return True
+        new_state = not bool(getattr(self, "_voice_on", False))
+        self._set_voice_state(new_state)
+        self.tg.send_message(chat_id,
+            "🔊 Voice replies ON — I'll answer with voice notes. Long or table-heavy replies still "
+            "come as text. /voice again to turn off."
+            if new_state else
+            "🔇 Voice replies OFF — back to text.")
+        return True
 
     def _set_voice_key(self, key: str, chat_id: int, message_id: int | None) -> bool:
         """Save an ElevenLabs key to enable voice, then delete the message so the secret isn't
@@ -567,9 +1436,22 @@ class AttachBridge:
                 "Usage: `/setkey <your ElevenLabs API key>` — enables voice-message transcription.\n"
                 "I'll delete your message right after so the key isn't left in the chat.")
             return True
+        from . import stt
+        if not stt.looks_like_api_key(key):
+            # Caught here, the user retypes once. Caught at the first voice message, it
+            # looks like the bridge is broken (2026-08-07: a legacy key sat in every
+            # config and every bot answered "HTTP 400" without saying why).
+            if message_id is not None:
+                self.tg.delete_message(chat_id, message_id)
+            self.tg.send_message(chat_id,
+                "That doesn't look like an ElevenLabs key — they start with `sk_`. "
+                "Grab a fresh one at elevenlabs.io → Profile → API Keys and send "
+                "`/setkey sk_…` again. (Your message is deleted either way.)")
+            return True
         self.cfg.elevenlabs_api_key = key
         try:
-            from .config import save
+            from .config import mark_secret_from_file, save
+            mark_secret_from_file(self.cfg, "elevenlabs_api_key")
             save(self.cfg)                       # persisted 0600 to the active config path
         except Exception as e:
             log.error("setkey: could not persist config: %s", e)
@@ -581,14 +1463,14 @@ class AttachBridge:
         return True
 
     def _typing_loop(self) -> None:
-        """Dedicated thread: assert "typing…" every TYPING_INTERVAL while a turn is active.
+        """Dedicated thread: assert "typing…" every TYPING_INTERVAL during Telegram turns.
 
         It runs independently of the outbound/send loop, so a flood-control sleep in the send path
         (which happens during a burst of messages) can never starve the indicator — that was the
         cause of mid-turn typing gaps. It stops the instant the turn ends (turn_active cleared), so
         no action fires after the final message and typing stops with it (bar Telegram's ~5s decay)."""
         while not self._stop.is_set():
-            if self._turn_active.is_set() and self._owner_chat is not None:
+            if self._turn_active.is_set() and self._turn_from_tg and self._owner_chat is not None:
                 now = time.monotonic()
                 gap = now - self._last_typing
                 if gap > self._max_gap:
@@ -637,6 +1519,7 @@ class AttachBridge:
         except OSError:
             return None
         last = None
+        last_key = None                              # transcript with no assistant text at all
         for raw in tail.split(b"\n"):
             line = raw.strip()
             if not line:
@@ -649,39 +1532,127 @@ class AttachBridge:
                 for ev in self._reader.parse(rec):
                     if ev.kind == "text" and ev.text and ev.text.strip():
                         last = ev.text
+                        last_key = ev.key            # dedup id of that very message
             except Exception:
                 continue
+        self._last_backstop_key = last_key
         return last
+
+    def _wait_backstop_retry(self) -> None:
+        stop = getattr(self, "_stop", None)
+        if stop is not None:
+            stop.wait(BACKSTOP_RETRY_DELAY)
+        else:
+            time.sleep(BACKSTOP_RETRY_DELAY)
+
+    def _retry_last_assistant_text(self) -> str | None:
+        last = self._last_assistant_text()
+        if last and last.strip():
+            return last
+        for attempt in range(BACKSTOP_RETRY_ATTEMPTS):
+            if self._turn_text_sent:
+                return None
+            try:
+                self._drain_transcript()
+            except Exception as e:
+                log.debug("turn-end backstop transcript drain failed: %s", e)
+            if self._turn_text_sent:
+                return None
+            last = self._last_assistant_text()
+            if last and last.strip():
+                return last
+            if attempt != BACKSTOP_RETRY_ATTEMPTS - 1:
+                self._wait_backstop_retry()
+        return None
+
+    def _consume_signal_text(self) -> str | None:
+        signal = getattr(self, "_signal", None)
+        if not signal or not signal.exists():
+            return None
+        try:
+            answer = signal.read_text("utf-8").strip()
+            signal.unlink()
+        except OSError:
+            return None
+        return answer or None
+
+    def _has_turn_end_backstop_source(self) -> bool:
+        return (getattr(self, "_transcript", None) is not None
+                or getattr(self, "_signal", None) is not None)
 
     def _finish_turn(self) -> None:
         """Drop the technical bubble and stop the typing indicator at the real end of a turn."""
         self._status_clear()
         was_active = self._turn_active.is_set()
+        from_tg_at_end = self._turn_from_tg
+        text_sent_at_end = self._turn_text_sent
+        reaction_at_end = getattr(self, "_turn_is_reaction", False)
         # Backstop: a Telegram-originated turn must NEVER go unanswered. If nothing was forwarded
         # this turn (the [tg] marker was forgotten, the turn was a long heads-down working stretch,
         # or interim forwarding missed it), deliver the final assistant message now. The
         # `_turn_text_sent` guard means this only fires when truly nothing was sent (no double-send),
         # and _send_final sets it True so a second _finish_turn won't re-fire.
-        if was_active and self._turn_from_tg and not self._turn_text_sent and self._owner_chat is not None:
-            last = self._last_assistant_text()
-            out = self._strip_marker(last) if last else ""
-            if out:
-                self._send_final(out)
-                log.info("TURN END backstop → forwarded final answer %r", out[:30])
+        if (was_active and self._turn_from_tg and not self._turn_text_sent
+                and not getattr(self, "_turn_is_reaction", False)
+                and self._owner_chat is not None
+                and getattr(self, "_turn_end_backstop_enabled", True)):
+            source = "transcript"
+            out = ""
+            if self._has_turn_end_backstop_source():
+                last = self._retry_last_assistant_text()
+                out = self._strip_marker(last) if last else ""
+                if not out and not self._turn_text_sent:
+                    source = "signal"
+                    answer = self._consume_signal_text()
+                    out = self._strip_marker(answer) if answer else ""
+            if out and not self._turn_text_sent:
+                # Send WITH the message's dedup key. Without it the backstop and the normal
+                # transcript path both queue the same text under different ids and the user
+                # gets it twice — proven from the log on 2026-08-02 (ids 433fa145 / 52df94c3,
+                # same text, same second). The key makes the queue recognise the duplicate.
+                self._send_final(out, key=getattr(self, "_last_backstop_key", "") or None)
+                log.info("TURN END backstop → forwarded final answer from %s %r",
+                         source, out[:30])
+            elif not self._turn_text_sent:
+                dur = time.monotonic() - self._turn_started
+                log.error("TURN END backstop: Telegram turn ended without an answer; "
+                          "dur=%.1fs typing_count=%d transcript_configured=%s "
+                          "signal_configured=%s",
+                          dur, self._typing_count, getattr(self, "_transcript", None) is not None,
+                          getattr(self, "_signal", None) is not None)
+        elif (was_active and self._turn_from_tg and not self._turn_text_sent
+                and self._owner_chat is not None
+                and not getattr(self, "_turn_is_reaction", False)):
+            # Should be unreachable — the branch above covers it. Kept because on 2026-08-23 a
+            # Telegram turn ended with no forward and NO log line at all, which made the cause
+            # impossible to determine after the fact. Whatever silently skips the backstop must
+            # leave a trace.
+            log.error("TURN END: Telegram turn ended unanswered and the backstop did not run "
+                      "(backstop_enabled=%s)", getattr(self, "_turn_end_backstop_enabled", True))
+        elif (was_active and getattr(self, "_turn_is_reaction", False)
+                and not self._turn_text_sent):
+            # Intended silence, but it must still be visible in the log — otherwise a genuinely
+            # lost reply would look exactly the same in the daily traffic analysis.
+            log.info("TURN END reaction turn without a reply (backstop deliberately skipped)")
         self._turn_active.clear()
         self._pending_turn_end = False
         self._consume_turn_end()
         if was_active:
-            log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs",
+            # from_tg/text_sent are in the line on purpose: when a reply goes missing, these two
+            # flags decide whether anything was even attempted, and reconstructing them
+            # afterwards from the log was impossible (2026-08-23).
+            log.info("TURN END t=%.2f dur=%.1fs typing_fired=%d max_gap=%.2fs "
+                     "from_tg=%s text_sent=%s reaction=%s",
                      time.time(), time.monotonic() - self._turn_started,
-                     self._typing_count, self._max_gap)
+                     self._typing_count, self._max_gap, from_tg_at_end, text_sent_at_end,
+                     reaction_at_end)
 
     def _end_turn(self) -> None:
         # Claude Stop-hook path: catch anything written just before the hook fired, then finish.
         self._drain_transcript()
         self._finish_turn()
 
-    # ---- outbound (session → Telegram) ------------------------------------
+
     def _outbound_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -695,16 +1666,32 @@ class AttachBridge:
                 #     if turn_active is unset (e.g. a restart mid-turn that would orphan a bubble).
                 #   * Fallback: force-end if the transcript went quiet too long (hook missing).
                 if self._pending_turn_end:
+                    zacatek = getattr(self, "_turn_begun_at", 0.0)
+                    if zacatek and time.monotonic() - zacatek < SUSPICIOUS_TURN_SECONDS:
+                        log.warning("turn ending after %.1fs — suspiciously fast, a stale "
+                                    "end-of-turn signal is the usual cause",
+                                    time.monotonic() - zacatek)
                     self._finish_turn()
                 elif self._turn_end is not None and self._turn_end.exists():
                     self._end_turn()
                 elif self._turn_active.is_set() and time.monotonic() - self._last_activity > IDLE_DONE:
-                    self._status_clear()
-                    self._turn_active.clear()
+                    # This branch used to just close the turn: the backstop didn't run, so the
+                    # reply wasn't sent and not even a log line was left. It was one of three ways
+                    # messages vanished without a trace (audit finding C). Turn end now goes
+                    # through one shared path regardless of what triggered it; the warning
+                    # distinguishes "ended in silence" from "the hook reported it".
+                    log.warning("konec turnu podle ticha (%.0f s bez aktivity), hook se neozval",
+                                IDLE_DONE)
+                    self._end_turn()
+                # Live retry: messages that failed to deliver are retried while running too.
+                # Replay only at startup meant, for a long-running service, waiting forever.
+                if time.monotonic() - getattr(self, "_last_inbound_retry", 0.0) > INBOUND_RETRY_INTERVAL:
+                    self._last_inbound_retry = time.monotonic()
+                    self._replay_pending_inbound()
                 self._beat()                  # reached only on a full, non-blocking forward cycle
             except Exception as e:
                 log.error("outbound error: %s", e)
-            self._stop.wait(0.4)
+            self._stop.wait(OUTBOUND_TICK)
 
     def _beat(self) -> None:
         """Touch the outbound heartbeat — proof the forward loop completed a cycle without blocking.
@@ -724,6 +1711,12 @@ class AttachBridge:
         # arrives (then re-created below it) and at turn end — so it always trails at the bottom.
         if self._owner_chat is None or not line or line == self._status["shown"]:
             return
+        # No live turn → no bubble. The bubble is technical progress and is deleted at turn end;
+        # one created outside a turn has nothing to delete it and hangs in the chat until the NEXT
+        # turn happens to finish. Seen in practice: "Editing MEMORY.md" stuck for eight
+        # minutes after a bridge restart drained the transcript with no turn running (2026-08-02).
+        if not self._turn_active.is_set():
+            return
         body = f"<i>{html.escape(line)}</i>"
         if self._status["mid"] is None:
             mid = self.tg.send_plain_id(self._owner_chat, body, parse_mode="HTML")
@@ -737,7 +1730,10 @@ class AttachBridge:
 
     def _status_clear(self) -> None:
         if self._status["mid"] is not None and self._owner_chat is not None:
-            self.tg.delete_message(self._owner_chat, self._status["mid"])
+            try:
+                self.tg.delete_message(self._owner_chat, self._status["mid"])
+            except Exception as e:
+                log.warning("status bubble cleanup failed: %s", e)
         self._status = {"mid": None, "shown": ""}
         self._seen_tools.clear()
         self._persist_status(None)
@@ -769,12 +1765,8 @@ class AttachBridge:
             pass
 
     def _drain_signal(self) -> None:
-        if not self._signal or not self._signal.exists():
-            return
-        try:
-            answer = self._signal.read_text("utf-8").strip()
-            self._signal.unlink()
-        except OSError:
+        answer = self._consume_signal_text()
+        if not answer:
             return
         if answer and self._owner_chat is not None:
             self._status_clear()                         # final message → drop the technical bubble
@@ -807,10 +1799,103 @@ class AttachBridge:
                 continue
             for ev in self._reader.parse(rec):
                 self._handle_event(ev)
-        # Any new transcript content during a Telegram turn = the agent is still working;
-        # refresh activity so the idle fallback doesn't fire prematurely.
+        # Any new transcript content during a Telegram turn = the agent is still working; refresh
+        # activity so the idle fallback doesn't fire prematurely.
         if self._turn_from_tg:
             self._last_activity = time.monotonic()
+
+    # ---- outgoing files ------------------------------------------------------
+    def _safe_outbox_path(self, raw: str):
+        """Validate a path the AGENT asked to send. Returns the resolved path or a reason.
+
+        The path comes from the agent's own reply text, so this is the security boundary:
+        without it, anything able to influence the agent's output could make the bridge
+        upload `~/.ssh/id_rsa`. Rules: must resolve inside an allowed directory (symlinks
+        are followed BEFORE the check), must be a regular file, must be non-empty.
+        """
+        try:
+            path = Path(raw).expanduser().resolve()
+        except OSError as e:
+            return None, f"cannot resolve ({e.__class__.__name__})"
+        allowed = self.cfg.allowed_outbox_dirs()
+        if not any(path == d or d in path.parents for d in allowed):
+            return None, ("outside the allowed folders — put it in "
+                          f"{self.cfg.path_outbox()} or add the folder to 'outbox_dirs'")
+        if not path.is_file():
+            return None, "not a regular file"
+        if path.stat().st_size == 0:
+            return None, "file is empty"
+        return path, "ok"
+
+    def _extract_files(self, text: str):
+        """Pull `[tg-file] <path>` lines out of a reply. Returns (text without them, paths)."""
+        marker = self.cfg.file_marker.lower()
+        keep, wanted = [], []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if s.lower().startswith(marker):
+                arg = s[len(self.cfg.file_marker):].strip().strip('"').strip("'")
+                if arg:
+                    wanted.append(arg)
+                continue
+            keep.append(ln)
+        return "\n".join(keep).strip(), wanted
+
+    def _send_files(self, paths: list[str]) -> None:
+        """Upload the requested files. A rejection is always reported back to the chat —
+        silently dropping an attachment would be worse than a visible error."""
+        for raw in paths:
+            resolved, reason = self._safe_outbox_path(raw)
+            if resolved is None:
+                log.warning("refusing to send %r: %s", raw, reason)
+                self._send_final(f"⚠️ Couldn't send {Path(raw).name}: {reason}", turn_text=False)
+                continue
+            try:
+                self.tg.send_file(self._owner_chat, resolved)
+            except Exception as e:
+                log.warning("file send failed (%s): %s", resolved.name, e)
+                self._send_final(f"⚠️ Couldn't send {resolved.name}: {e}", turn_text=False)
+
+    def _send_one_file(self, raw: str) -> None:
+        """Send one attachment from the durable outbox.
+
+        Distinguishes two kinds of failure because they are handled oppositely:
+        a path outside the allowed folders is a PERMANENT rejection — reported and treated as
+        done, else it would clog the queue forever. A send error is TRANSIENT and is let out,
+        aby ji outbox zkusil znovu.
+        """
+        resolved, reason = self._safe_outbox_path(raw)
+        if resolved is None:
+            self._ohlas_trvale_odmitnuti(Path(raw).name, reason)
+            return
+        try:
+            self.tg.send_file(self._owner_chat, resolved)
+        except OSError as e:
+            # The file vanished or can't be read — retrying won't fix it.
+            self._ohlas_trvale_odmitnuti(resolved.name, str(e))
+        # Other errors (including TelegramError) are let out as transient. Classifying them
+        # binarily proved a trap: an unclear error would either be dropped (message loss) or
+        # retried forever (a clogged FIFO queue blocking every later reply — finding F2).
+        # Instead of guessing, it is retried a BOUNDED number of times and then given up; the
+        # outbox keeps the counter.
+
+    def _report_permanent_refusal(self, name: str, reason: str) -> None:
+        """Report an attachment not worth retrying and treat it as done. A silent drop would be
+        worse than a visible error — and a clogged queue worse still."""
+        log.warning("refusing to send attachment %s: %s", name, reason)
+        try:
+            self.tg.send_message(self._owner_chat, f"⚠️ Couldn't send {name}: {reason}")
+        except Exception as e:
+            log.warning("could not report the rejected attachment: %s", e)
+
+    def _flush_files(self) -> None:
+        """Upload whatever the last reply asked for. Kept separate from the text path so a
+        failed upload can never block or duplicate the message itself."""
+        files = getattr(self, "_pending_files", [])
+        if not files:
+            return
+        self._pending_files = []
+        self._send_files(files)
 
     def _strip_marker(self, text: str) -> str:
         """Remove the progress marker (e.g. ``[TG]``) from the start of *any* line. It's a routing
@@ -829,10 +1914,22 @@ class AttachBridge:
         if ev.kind == "user":
             # Remember whether this turn came from Telegram (origin prefix) — only those are
             # forwarded; terminal-originated turns stay local.
-            self._turn_from_tg = ev.text.lstrip().startswith(self._origins)
+            #
+            # A record WITHOUT the prefix may never downgrade a turn that is already marked as
+            # Telegram-originated. The reader now filters tool results out, but anything else the
+            # transcript files as a "user" record would otherwise silently reclassify a live turn
+            # as local — and then the answer is never forwarded, the backstop never runs, and
+            # nothing at all appears in the log. That happened on 2026-08-23. A new turn resets
+            # the flag in _begin_turn; that is the only place it may go back to False.
+            if ev.text.lstrip().startswith(self._origins):
+                self._turn_from_tg = True
+            elif not self._turn_active.is_set():
+                self._turn_from_tg = False
             return
         if ev.kind == "turn_start":
-            return                              # inbound already lit typing; nothing else to do
+            if not self._turn_active.is_set():
+                self._turn_from_tg = False
+            return                              # local TUI turns do not make Telegram inbound busy
         if ev.kind == "turn_end":
             self._pending_turn_end = True       # outbound loop finishes the turn after this drain
             return
@@ -847,6 +1944,15 @@ class AttachBridge:
                 # Reliable forward: the dedup ledger is marked only AFTER a confirmed send, and a
                 # failed send is queued + retried — so a reply is never silently dropped.
                 self._send_final(out, key=ev.key)
+        elif ev.kind == "files":
+            # The agent used its own file-sending tool. The harness runs that tool itself, so the
+            # bridge never sees a call — only this record in the transcript. Deliver the files the
+            # same way as a [tg-file] line, INCLUDING the allowlist check: the path comes from
+            # agent output either way, so the security boundary must not differ.
+            if ev.key in self._seen_tools:
+                return                            # already handled (transcript re-read on resume)
+            self._seen_tools.add(ev.key)
+            self._send_files(list(ev.files))
         elif ev.kind == "tool":
             if self.cfg.agent == "codex":
                 return                            # Codex tools come live from the TUI scraper
@@ -855,6 +1961,25 @@ class AttachBridge:
                 self._status_push(ev.text)
 
     # ---- media helpers (reuse the same download/STT as one-shot mode) ------
+    def _reject_audio_too_large(self, chat_id: int, size: int | None) -> None:
+        mb = (int(size or 0) + 1024 * 1024 - 1) // (1024 * 1024)
+        self.tg.send_message(
+            chat_id,
+            f"🎤 That audio is ~{mb} MB. Voice/audio limit is 25 MB — "
+            "please send a shorter clip or write it as text.",
+        )
+
+    def _limit_inbound_prompt(self, text: str, chat_id: int) -> str | None:
+        if len(text) <= MAX_INBOUND_PROMPT_CHARS:
+            return text
+        self.tg.send_message(
+            chat_id,
+            f"⚠️ That message is too long after processing ({len(text)} characters). "
+            f"Please shorten it to {MAX_INBOUND_PROMPT_CHARS} characters or less.",
+        )
+        log.warning("inbound prompt too long: %d characters", len(text))
+        return None
+
     def _transcribe(self, media: dict, chat_id: int) -> str | None:
         from . import stt
         if not self.cfg.elevenlabs_api_key:
@@ -863,13 +1988,30 @@ class AttachBridge:
                 "`/setkey <your-key>` (I'll delete the message right after) — then resend the voice note.")
             return None
         try:
+            size = int(media.get("file_size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size > MAX_AUDIO_BYTES:
+            self._reject_audio_too_large(chat_id, size)
+            log.warning("voice/audio too large for STT: %s bytes", size)
+            return None
+        try:
             fp = self.tg.get_file_path(media["file_id"])
             audio = self.tg.download(fp)
+            if len(audio) > MAX_AUDIO_BYTES:
+                self._reject_audio_too_large(chat_id, len(audio))
+                log.warning("downloaded voice/audio too large for STT: %s bytes", len(audio))
+                return None
             return stt.transcribe(audio, api_key=self.cfg.elevenlabs_api_key,
                                   filename=Path(fp).name or "voice.ogg")
         except Exception as e:
             log.error("transcription failed: %s", e)
-            self.tg.send_message(chat_id, f"⚠️ Couldn't transcribe: {e}")
+            # This is an inbound voice-note failure, not agent output for the current turn.
+            self._send_final(
+                f"🎤 Voice transcription failed ({e}). "
+                "Please resend it or type your message instead.",
+                turn_text=False,
+            )
             return None
 
     def _download_note(self, msg: dict, chat_id: int) -> str:
@@ -903,6 +2045,11 @@ class AttachBridge:
         d = Path.home() / ".local/state/agent2telegram/attachments"
         d.mkdir(parents=True, exist_ok=True)
         dest = d / name
+        if dest.exists():
+            i = 1
+            while (cand := d / f"{dest.stem}-{i}{dest.suffix}").exists():
+                i += 1
+            dest = cand
         dest.write_bytes(data)
         log.info("saved attachment -> %s (%d bytes)", dest, len(data))
         return f"[The user attached a file saved at: {dest} — open and use it as appropriate.]"
