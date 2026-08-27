@@ -70,6 +70,11 @@ QUEUE_ACK_COOLDOWN = 30.0
 # How many characters of a quoted message are passed to the agent. Enough to recognise, few
 # enough not to flood the prompt.
 REPLY_QUOTE_CHARS = 300
+
+#: Jak dlouho po první reakci považovat tutéž reakci na tutéž zprávu za duplicitu.
+#: Telegram jich 2026-08-26 poslal šest během 13 sekund. Okno je krátké, aby se nezahodila
+#: reakce, kterou uživatel opravdu sundá a znovu dá.
+REACTION_DEDUP_S = 60.0
 #: How often we re-assert the "typing…" chat action (Telegram shows it for ~5s). Kept well
 #: under that window so a turn never shows a gap, even right after a sent message clears it.
 TYPING_INTERVAL = 1.5
@@ -212,6 +217,7 @@ class AttachBridge:
             raise ValueError("attach mode requires 'tmux_session' in config")
         self.cfg = cfg
         self.tg = client or TelegramClient(cfg.token)
+        self._reaction_seen: dict = {}   # (chat, msg, emoji) -> čas první reakce
         self._allowed = set(cfg.allowed_user_ids)
         self._marker = cfg.progress_marker
         self._origin = cfg.origin_prefix
@@ -1088,6 +1094,28 @@ class AttachBridge:
             emojis = "".join(r.get("emoji", "") for r in mr.get("new_reaction", [])
                              if r.get("type") == "emoji")
             if emojis:
+                # Telegram can emit the SAME reaction several times in a row: on 2026-08-26 one
+                # ❤️ arrived as six separate updates within 13 seconds (update_id 36303177-182),
+                # so the agent was asked for a one-line answer six times and the user got a
+                # burst of cat emojis. The reaction itself is identified by chat + message +
+                # emoji, so a repeat of that triple inside a short window is a duplicate, never
+                # a second opinion. This is identity matching, not guessing from content.
+                key = (mr.get("chat", {}).get("id"), mr.get("message_id"), emojis)
+                now = time.time()
+                # Most kdysi stavěl instance i bez __init__ (testy, starší kód), takže na
+                # existenci atributu se nedá spolehnout – založit ho líně.
+                if getattr(self, "_reaction_seen", None) is None:
+                    self._reaction_seen = {}
+                seen = self._reaction_seen.get(key)
+                if seen is not None and now - seen < REACTION_DEDUP_S:
+                    log.info("reaction %s on #%s ignored as a duplicate (%.1fs after the first)",
+                             emojis, mr.get("message_id"), now - seen)
+                    return True
+                self._reaction_seen[key] = now
+                if len(self._reaction_seen) > 512:      # drobná pojistka proti růstu
+                    for k in sorted(self._reaction_seen, key=self._reaction_seen.get)[:256]:
+                        self._reaction_seen.pop(k, None)
+
                 # A reaction DOES deserve an answer, but a one-liner — being left on read feels
                 # like the bridge swallowed it. The prompt therefore asks for a very short reply.
                 #

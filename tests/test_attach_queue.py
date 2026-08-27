@@ -448,3 +448,58 @@ class InboundLogLineTests(unittest.TestCase):
                       f"reply_to must carry the QUOTED message, got: {line}")
         self.assertTrue(line.rstrip().endswith("'fix this'"),
                         f"the line must end with the message itself, got: {line}")
+
+
+class ReactionDedupTests(unittest.TestCase):
+    """Jedno ❤️ nesmí vyvolat šest odpovědí.
+
+    2026-08-26 poslal Telegram tutéž reakci jako šest samostatných updatů během 13 sekund
+    (update_id 36303177-182). Agent na každý odpověděl jednou emoji, takže uživateli přišla
+    salva koček. Reakce je jednoznačně určená trojicí chat + zpráva + emoji.
+    """
+
+    def _postav(self):
+        b = _bridge()
+        b._reaction_seen = {}
+        b._injected = []
+        b._inject = lambda text: (b._injected.append(text), True)[1]
+        b._begin_turn = lambda: None
+        b._turn_active = threading.Event()
+        return b
+
+    def _upd(self, uid, emoji="❤️", msg_id=20800, chat=1):
+        return {"update_id": uid, "message_reaction": {
+            "user": {"id": 7}, "chat": {"id": chat}, "message_id": msg_id,
+            "new_reaction": [{"type": "emoji", "emoji": emoji}]}}
+
+    def test_sestkrat_stejna_reakce_je_jedna_odpoved(self):
+        b = self._postav()
+        for uid in range(36303177, 36303183):
+            b._handle(self._upd(uid))
+        self.assertEqual(len(b._injected), 1, f"agent dostal {len(b._injected)} pobídek místo jedné")
+
+    def test_jina_zprava_projde(self):
+        b = self._postav()
+        b._handle(self._upd(1, msg_id=100))
+        b._handle(self._upd(2, msg_id=101))
+        self.assertEqual(len(b._injected), 2, "reakce na jinou zprávu se nesmí zahodit")
+
+    def test_jine_emoji_projde(self):
+        b = self._postav()
+        b._handle(self._upd(1, emoji="❤️"))
+        b._handle(self._upd(2, emoji="👍"))
+        self.assertEqual(len(b._injected), 2, "jiné emoji je jiná zpětná vazba")
+
+    def test_po_uplynuti_okna_projde_znovu(self):
+        b = self._postav()
+        b._handle(self._upd(1))
+        klic = list(b._reaction_seen)[0]
+        b._reaction_seen[klic] -= attach_mod.REACTION_DEDUP_S + 1
+        b._handle(self._upd(2))
+        self.assertEqual(len(b._injected), 2, "po vypršení okna má reakce projít")
+
+    def test_pamet_neroste_donekonecna(self):
+        b = self._postav()
+        for i in range(700):
+            b._handle(self._upd(i, msg_id=i))
+        self.assertLessEqual(len(b._reaction_seen), 512)
