@@ -64,10 +64,44 @@ if [ -f "pyproject.toml" ] && grep -q "agent2telegram" pyproject.toml 2>/dev/nul
   SRC="$(pwd)"
   say "Installing from current directory"
 else
-  command -v git >/dev/null || err "git not found (needed to fetch the project)."
   SRC="${HOME}/.agent2telegram-src"
-  if [ -d "$SRC/.git" ]; then say "Updating $SRC"; git -C "$SRC" pull --ff-only
-  else say "Cloning into $SRC"; git clone --depth 1 "$REPO" "$SRC"; fi
+  # git first: a real clone keeps `agent2telegram update` working later. But git over HTTPS
+  # can be refused where plain HTTPS is fine — a datacentre IP that GitHub rate-limits for
+  # anonymous git answers 401 and git then asks for a password, on a PUBLIC repo and on a
+  # brand-new machine. That is a bad way to meet a tool, so falling back to the tarball keeps
+  # the install going. Never prompt: an unattended installer must not stop on a password.
+  fetch_tarball() {
+    say "Fetching the source archive (no git)"
+    tmp="$(mktemp -d)"
+    url="https://codeload.github.com/petrludwig-collab/Agent2Telegram/tar.gz/refs/heads/main"
+    curl -fsSL --retry 2 "$url" -o "$tmp/src.tgz" || return 1
+    tar xzf "$tmp/src.tgz" -C "$tmp" || return 1
+    dir="$(find "$tmp" -maxdepth 1 -type d -name 'Agent2Telegram-*' | head -1)"
+    [ -n "$dir" ] || return 1
+    rm -rf "$SRC"; mkdir -p "$SRC"; cp -R "$dir"/. "$SRC"/ || return 1
+    rm -rf "$tmp"
+    say "Installed from archive — 'agent2telegram update' will ask you to re-run this installer."
+  }
+  if [ -d "$SRC/.git" ]; then
+    say "Updating $SRC"
+    GIT_TERMINAL_PROMPT=0 git -C "$SRC" pull --ff-only || fetch_tarball || err "Could not fetch the project."
+  elif command -v git >/dev/null 2>&1; then
+    say "Cloning into $SRC"
+    # GitHub answers 401 to anonymous git from datacentre IPs intermittently — the very next
+    # attempt usually succeeds (Hermes' own installer recovers the same way, on try 2 of 4).
+    # Retry before giving up on git, because a real clone is what keeps `update` working;
+    # the tarball is the last resort, not the second choice.
+    n=1
+    while [ "$n" -le 3 ]; do
+      GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$REPO" "$SRC" 2>/dev/null && break
+      rm -rf "$SRC"
+      n=$((n+1))
+      [ "$n" -le 3 ] && { say "Clone refused, retrying ($n/3)"; sleep 2; }
+    done
+    [ -d "$SRC/.git" ] || fetch_tarball || err "Could not fetch the project."
+  else
+    fetch_tarball || err "Could not fetch the project (no git, and the archive download failed)."
+  fi
 fi
 
 # 3) Make `agent2telegram` a real command. pip is OPTIONAL (the core is pure standard library):

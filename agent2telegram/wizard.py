@@ -467,6 +467,19 @@ def set_elevenlabs(config: str | None = None) -> int:
     if not key:
         print("Nothing entered — aborted.")
         return 1
+    # The same shape check the /setkey chat command already does. It was missing here, and the
+    # web UI hands you a "Copy Key ID" button but no way to re-read the key itself — so pasting
+    # the ID is the easy mistake, and without this it only surfaces later as a bare HTTP 400.
+    from . import stt
+    if not stt.looks_like_api_key(key):
+        print("  ✗ That looks like a key ID, not a key. ElevenLabs keys start with 'sk_' and are")
+        print("    shown only once, when you create or rotate them — the list view can only copy")
+        print("    the ID. Create a new key at elevenlabs.io → Developers → API keys.")
+        return 1
+    # Scribe guesses the language when we don't say. On a short clip it guesses badly: a
+    # three-second Czech note came back as the English word "Down".
+    lang = input("Language code for transcription (blank = auto-detect, e.g. cs, de, en): ").strip()
+    cfg.elevenlabs_language = lang
     cfg.elevenlabs_api_key = key
     mark_secret_from_file(cfg, "elevenlabs_api_key")
     path = save(cfg)
@@ -501,7 +514,76 @@ def set_elevenlabs(config: str | None = None) -> int:
             print("  (no running bridge found — start it and the key will be picked up).")
     except Exception as e:
         print(f"  (restart skipped: {e}) — restart the bridge manually to apply the key.")
+    _also_configure_hermes(key, cfg.elevenlabs_language)
     return 0
+
+
+def _hermes_set(exe: str, klic: str, hodnota: str) -> bool:
+    """`hermes config set <key> <value>`, tolerating both CLI generations.
+
+    Older builds reject `--force` outright ("unrecognized arguments"), newer ones want it to
+    overwrite an existing value. Trying the documented form first and falling back keeps this
+    working on whatever the user installed."""
+    import subprocess
+    for argv in ([exe, "config", "set", klic, hodnota],
+                 [exe, "config", "set", "--force", klic, hodnota]):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except Exception:
+            return False
+        if r.returncode == 0 and "unrecognized arguments" not in (r.stderr or ""):
+            return True
+    return False
+
+
+def _also_configure_hermes(key: str, language: str = "") -> None:
+    """Hand the same key AND the same language to Hermes if it is installed here.
+
+    Hermes runs its own Telegram gateway with its own transcription, so a key set here does
+    nothing for it — someone who set the key once and then found Hermes still deaf would have
+    no way to guess why. One ElevenLabs account, one key: set it in both places.
+
+    The language matters just as much and used to be left out: Hermes then transcribed Czech
+    speech into ENGLISH text (2026-09-03), which looks like a broken transcriber rather than a
+    missing setting. Its key is `stt.elevenlabs.language_code`.
+
+    Best-effort by design: Hermes not being installed is the normal case, and nothing here may
+    fail the command that already succeeded.
+    """
+    import shutil
+    exe = shutil.which("hermes")
+    if not exe:
+        return
+    if not _hermes_set(exe, "ELEVENLABS_API_KEY", key):
+        print("  (Hermes found, but setting its key failed — set it with: "
+              "hermes config set ELEVENLABS_API_KEY sk_…)")
+        return
+    print("  ✓ Hermes found on this machine — gave it the same key.")
+    # Hermes' STT provider defaults to "local" (faster-whisper). Handing it an ElevenLabs key
+    # without switching the provider is a guaranteed no-op: on 2026-09-03 it kept transcribing
+    # Czech speech into English through the local model while the key sat unused. Selecting the
+    # provider is what makes "gave it the same key" actually mean something.
+    if _hermes_set(exe, "stt.provider", "elevenlabs"):
+        print("  ✓ Switched Hermes' transcription to ElevenLabs (it defaults to a local model).")
+    else:
+        print("  (switch it yourself:  hermes config set stt.provider elevenlabs)")
+    # Hermes' LOCAL transcriber is hard-defaulted to English (DEFAULT_LOCAL_STT_LANGUAGE = "en"),
+    # NOT to auto-detect. So it needs setting either way: to the chosen language, or explicitly to
+    # "" when the user picked auto-detect — otherwise "auto-detect" silently means English, which
+    # is the opposite of what they asked for. Belt and braces for a build that ignores the
+    # provider switch, or a user who later moves back to the local model.
+    _hermes_set(exe, "stt.local.language", language)
+    if language:
+        if _hermes_set(exe, "stt.elevenlabs.language_code", language):
+            print(f"  ✓ Told Hermes to transcribe in '{language}' too.")
+        else:
+            print(f"  (set Hermes' language yourself:  hermes config set "
+                  f"stt.elevenlabs.language_code {language})")
+    r = subprocess.run([exe, "gateway", "restart"], capture_output=True, text=True, timeout=300)
+    if r.returncode == 0:
+        print("  ✓ Restarted the Hermes gateway so it picks the key up.")
+    else:
+        print("  (restart Hermes yourself to apply it:  hermes gateway restart)")
 
 
 if __name__ == "__main__":   # pragma: no cover

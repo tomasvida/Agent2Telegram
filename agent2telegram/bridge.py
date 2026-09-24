@@ -53,6 +53,7 @@ class Bridge:
         self.adapter = adapters.build(cfg)
         self._allowed = set(cfg.allowed_user_ids)
         self._stt_key = cfg.elevenlabs_api_key
+        self._stt_lang = getattr(cfg, "elevenlabs_language", "") or None
         self._stop = threading.Event()
         self._workers: dict[int, "_ChatWorker"] = {}
         self._workers_lock = threading.Lock()
@@ -230,7 +231,8 @@ class Bridge:
         try:
             file_path = self.tg.get_file_path(file_id)
             audio = self.tg.download(file_path)
-            return stt.transcribe(audio, api_key=self._stt_key, filename=Path(file_path).name or "voice.ogg")
+            return stt.transcribe(audio, api_key=self._stt_key, language=self._stt_lang,
+                                  filename=Path(file_path).name or "voice.ogg")
         except Exception as e:
             log.error("voice transcription failed: %s", e)
             self.tg.send_message(chat_id, f"⚠️ Couldn't transcribe the voice message: {e}")

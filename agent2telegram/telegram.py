@@ -374,16 +374,20 @@ class TelegramClient:
             return
         log.info("sent %s (%s, %d bytes)", os.path.basename(path), method, size)
 
-    def send_voice(self, chat_id: int, path) -> None:
+    def send_voice(self, chat_id: int, path, *, duration: int | None = None) -> dict:
         """Send an OGG/OPUS file as a Telegram VOICE note (a bubble with a waveform), not a
         nondescript audio attachment. The file must already be OGG/OPUS; conversion is the
-        caller's job (ffmpeg)."""
+        caller's job (ffmpeg). *duration* (seconds) is passed through when known so the client
+        does not have to guess the length of a long note (2026-09-05: clipped long narrations)."""
         path = os.fspath(path)
         with open(path, "rb") as fh:
             payload = fh.read()
-        self._call_multipart("sendVoice", {"chat_id": chat_id}, "voice",
-                             os.path.basename(path), payload)
-        log.info("sent voice note (%d bytes)", len(payload))
+        fields = {"chat_id": chat_id}
+        if duration:
+            fields["duration"] = str(int(duration))
+        out = self._call_multipart("sendVoice", fields, "voice", os.path.basename(path), payload)
+        log.info("sent voice note (%d bytes, duration=%s)", len(payload), duration)
+        return out
 
     def send_message(self, chat_id: int, text: str, *, parse_mode: str = "auto") -> None:
         """Send text, splitting to Telegram's size limit. By default (``parse_mode="auto"``)

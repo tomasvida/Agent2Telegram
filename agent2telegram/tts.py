@@ -29,7 +29,7 @@ TTS_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 #: Eleven v3 (out of alpha 2026-08). Multilingual, so the voice follows the CONVERSATION's
 #: language from the text itself. Against v2 it reads numbers more accurately and generates more
 #: steadily (error rate 15.3% -> 4.9%). Speech-to-text (Scribe) is a separate path, unaffected.
-DEFAULT_MODEL_ID = "eleven_v3"
+DEFAULT_MODEL_ID = "eleven_turbo_v2_5"   # 2026-09-05: v3/v2 drift into a whisper on long text; turbo measured flat (3 dB range over 150 s)
 #: ElevenLabs returns mp3 here; the bridge converts to OGG/OPUS (ffmpeg) before sendVoice.
 DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 TRANSIENT_BACKOFFS = (1.0, 3.0)
@@ -68,6 +68,16 @@ def _describe_error(err: BaseException) -> str:
     return str(err) or err.__class__.__name__
 
 
+
+def voice_settings_for(model_id: str) -> dict:
+    """Steady, full-voice delivery. Petr (2026-09-05) heard a long narration drop into a whisper
+    halfway through: with default settings the voice drifts over long generations. High
+    stability keeps it level; v3 only accepts 0.0 / 0.5 / 1.0 (Creative / Natural / Robust)."""
+    if str(model_id or "").startswith("eleven_v3"):
+        return {"stability": 1.0, "similarity_boost": 0.8, "use_speaker_boost": True}
+    return {"stability": 0.9, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": True}
+
+
 def synthesize(text: str, *, api_key: str, voice_id: str, model_id: str = DEFAULT_MODEL_ID,
                output_format: str = DEFAULT_OUTPUT_FORMAT, opener=None, timeout: float = 60,
                retry_backoffs: tuple[float, ...] = TRANSIENT_BACKOFFS,
@@ -78,7 +88,8 @@ def synthesize(text: str, *, api_key: str, voice_id: str, model_id: str = DEFAUL
     if not (text or "").strip():
         raise TTSError("nothing to speak")
     url = TTS_URL.format(voice_id=voice_id) + f"?output_format={output_format}"
-    body = json.dumps({"text": text, "model_id": model_id}).encode("utf-8")
+    body = json.dumps({"text": text, "model_id": model_id,
+                       "voice_settings": voice_settings_for(model_id)}).encode("utf-8")
     req = urllib.request.Request(
         url, data=body,
         headers={"xi-api-key": api_key, "Content-Type": "application/json",
@@ -107,3 +118,46 @@ def synthesize(text: str, *, api_key: str, voice_id: str, model_id: str = DEFAUL
         log.warning("ElevenLabs TTS transient failure (%d/%d): %s", attempt + 1, attempts, detail)
         sleeper(retry_backoffs[attempt])
     raise TTSError("ElevenLabs TTS failed")   # pragma: no cover
+
+
+# ── Long narrations (2026-09-05) ─────────────────────────────────────────────────────────
+# Petr: "klidně pět minut, ať to má délku skoro jako podcast, když řídíme". One ElevenLabs
+# request takes a few thousand characters at most and long single requests are where the
+# alpha v3 model gets flaky, so a long text is spoken in sentence-sized pieces and the
+# caller glues the audio together. Splitting is by SENTENCE, never mid-word.
+LONG_CHUNK_CHARS = 350   # ~20 s of speech per request: measured flat (±1.5 dB) where 700 already sagged 4–7 dB
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
+
+
+def split_for_tts(text: str, max_chars: int = LONG_CHUNK_CHARS) -> list[str]:
+    """Split *text* into pieces of at most *max_chars*, cutting only at sentence ends (or,
+    for a single over-long sentence, at the last space before the limit). Empty input → []."""
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    parts: list[str] = []
+    for sentence in _SENTENCE_END.split((text or "").strip()):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        while len(sentence) > max_chars:                      # one monster sentence
+            cut = sentence.rfind(" ", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            parts.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if parts and len(parts[-1]) + 1 + len(sentence) <= max_chars:
+            parts[-1] = f"{parts[-1]} {sentence}"
+        else:
+            parts.append(sentence)
+    return [p for p in parts if p]
+
+
+def synthesize_long(text: str, *, api_key: str, voice_id: str, model_id: str = DEFAULT_MODEL_ID,
+                    max_chars: int = LONG_CHUNK_CHARS, **kwargs) -> list[bytes]:
+    """Speak a long text as a list of mp3 segments (one per :func:`split_for_tts` piece), in
+    order. The caller concatenates them (ffmpeg). Raises :class:`TTSError` like :func:`synthesize`."""
+    pieces = split_for_tts(text, max_chars=max_chars)
+    if not pieces:
+        raise TTSError("nothing to speak")
+    return [synthesize(piece, api_key=api_key, voice_id=voice_id, model_id=model_id, **kwargs)
+            for piece in pieces]

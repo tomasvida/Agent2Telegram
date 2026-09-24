@@ -95,13 +95,22 @@ def _multipart(fields: dict[str, str], filename: str, audio: bytes,
 
 
 def transcribe_elevenlabs(audio: bytes, *, api_key: str, filename: str = "voice.ogg",
+                          language: str | None = None,
                           opener=None, timeout: float = 120,
                           retry_backoffs: tuple[float, ...] = TRANSIENT_BACKOFFS,
                           sleeper=time.sleep) -> str:
-    """Transcribe *audio* bytes with ElevenLabs Scribe. Returns the recognized text."""
+    """Transcribe *audio* bytes with ElevenLabs Scribe. Returns the recognized text.
+
+    *language* is an ISO-639 code (``cs``, ``de``, …). Without it Scribe guesses, and on a
+    short clip it guesses badly — a three-second Czech note came back as the English word
+    "Down". Telling it the language costs nothing and removes a whole class of nonsense.
+    """
     if not api_key:
         raise STTError("no ElevenLabs API key configured")
-    boundary, body = _multipart({"model_id": MODEL_ID}, filename, audio)
+    pole = {"model_id": MODEL_ID}
+    if language:
+        pole["language_code"] = language
+    boundary, body = _multipart(pole, filename, audio)
     req = urllib.request.Request(
         ELEVENLABS_URL,
         data=body,
@@ -161,6 +170,7 @@ def looks_like_api_key(key: str) -> bool:
     return bool(key) and key.strip().startswith("sk_")
 
 
-def transcribe(audio: bytes, *, api_key: str, filename: str = "voice.ogg") -> str:
+def transcribe(audio: bytes, *, api_key: str, filename: str = "voice.ogg",
+               language: str | None = None) -> str:
     """Provider dispatcher (only ElevenLabs Scribe today)."""
-    return transcribe_elevenlabs(audio, api_key=api_key, filename=filename)
+    return transcribe_elevenlabs(audio, api_key=api_key, filename=filename, language=language)
